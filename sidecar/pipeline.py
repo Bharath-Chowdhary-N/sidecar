@@ -20,7 +20,14 @@ from sidecar import subtraction
 from sidecar import truth_matching
 from sidecar import truth_retrieval
 from sidecar.database import save_dia_objects_from_subtraction
-from sidecar.source_detection import detect_and_measure_sources
+from sidecar.source_detection import (
+    DEFAULT_SINGLE_PIXEL_AREA_ATOL,
+    DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
+    DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
+    DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
+    _single_pixel_suspects,
+    detect_and_measure_sources,
+)
 from sidecar import util
 from sidecar.util import (
     find_templates_for_observation_ids,
@@ -124,6 +131,11 @@ class Detection:
         reject_center_jump_det=False,
         bad_pixel_columns=None,
         center_flag_columns=None,
+        reject_single_pixel=True,
+        single_pixel_min_input_snr=DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
+        single_pixel_min_r2_r3=DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
+        single_pixel_min_peak_r3=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
+        single_pixel_area_atol=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
     ):
         if not np.isfinite(cleaned_score_min_snr) or cleaned_score_min_snr < 0:
             raise ValueError("cleaned_score_min_snr must be finite and nonnegative")
@@ -158,6 +170,16 @@ class Detection:
         self.threshold = threshold
         self.threshold_column = threshold_column
         self.cleaned_score_min_snr = cleaned_score_min_snr
+        self.single_pixel_options = {
+            "min_input_snr": single_pixel_min_input_snr,
+            "min_r2_r3": single_pixel_min_r2_r3,
+            "min_peak_r3": single_pixel_min_peak_r3,
+            "area_atol": single_pixel_area_atol,
+        }
+        for name, value in self.single_pixel_options.items():
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"single_pixel_{name} must be finite and nonnegative")
+        self.reject_single_pixel = reject_single_pixel
         self.center_dq_flags = center_dq_flags | (int(dqflags.pixel.JUMP_DET) if reject_center_jump_det else 0)
         self.bad_pixel_columns = (
             ["template_flags_npix_bad", "science_flags_npix_bad", "flags_npix_bad"]
@@ -289,6 +311,8 @@ class Detection:
         min_abs_snr=None,
         center_flag_columns=None,
         center_dq_flags=0,
+        single_pixel_product=None,
+        single_pixel_options=None,
         **radius_kwargs,
     ):
         """Reject stars from subtraction detection catalogs
@@ -319,6 +343,11 @@ class Detection:
         center_dq_flags : int, optional
             Bit mask of center-pixel flags to reject. Unmeasured or masked center
             flags are also rejected when the mask is nonzero. Zero disables this cut.
+        single_pixel_product : str, optional
+            Product column prefix, e.g. "diff", enabling the input-image concentration cut.
+            Rows that cannot be assessed are retained.
+        single_pixel_options : dict, optional
+            Thresholds passed to `_single_pixel_suspects`.
         radius_kwargs :
             ref_mag, scale, max_radius, mag_col for a magnitude-dependent radius; see util.reject_stars
 
@@ -362,6 +391,17 @@ class Detection:
             good = np.ma.filled(np.isfinite(snr) & (np.abs(snr) >= min_abs_snr), False)
             SNLogger.info(f"Removing {np.count_nonzero(~good)} detections below the absolute S/N threshold")
             cleaned_detection = cleaned_detection[good]
+
+        if single_pixel_product is not None:
+            suspects, measurable = _single_pixel_suspects(
+                cleaned_detection, single_pixel_product, **(single_pixel_options or {})
+            )
+            SNLogger.info(f"Removing {np.count_nonzero(suspects)} concentrated single-pixel candidates")
+            if np.any(~measurable):
+                SNLogger.warning(
+                    f"Keeping {np.count_nonzero(~measurable)} candidates with inconclusive single-pixel measurements"
+                )
+            cleaned_detection = cleaned_detection[~suspects]
 
         write_catalog(cleaned_detection, cleaned_difference_detection_path, overwrite=True)
 
@@ -529,7 +569,7 @@ class Detection:
         Uses instance settings for everything not passed as an argument: `cross_convolve`, `save_debug_products`,
         `detection_kwargs`, `resample_method`, `sfft_kwargs`, `pre_smooth_sigma`, `input_star_catalog_path`,
         `threshold`, `threshold_column`, `cleaned_score_min_snr`, `center_dq_flags`, `bad_pixel_columns`,
-        `center_flag_columns`, and `save_candidates_to_database`.
+        `center_flag_columns`, `reject_single_pixel`, `single_pixel_options`, and `save_candidates_to_database`.
 
         Parameters
         ----------
@@ -691,6 +731,8 @@ class Detection:
                     bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "simple_diff"),
                     center_flag_columns=_product_flag_columns(self.center_flag_columns, "simple_diff"),
                     center_dq_flags=self.center_dq_flags,
+                    single_pixel_product="simple_diff" if self.reject_single_pixel else None,
+                    single_pixel_options=self.single_pixel_options,
                 )
 
             SNLogger.info("Removing known stars from diffim image detection")
@@ -703,9 +745,13 @@ class Detection:
                     file_path["difference_detection_path"],
                     self.REJECT_MATCH_RADIUS,
                     file_path["cleaned_difference_detection_path"],
+                    single_pixel_product="diff" if self.reject_single_pixel else None,
+                    single_pixel_options=self.single_pixel_options,
                 )
             except FileNotFoundError as e:
-                SNLogger.warning(f"Skipping star rejection for diffim detection; catalog not found: {file_path['difference_detection_path']}")
+                SNLogger.warning(
+                    f"Skipping star rejection for diffim detection; catalog not found: {file_path['difference_detection_path']}"
+                )
 
             SNLogger.info("Removing known stars from score image detection")
             try:
@@ -719,9 +765,13 @@ class Detection:
                     center_dq_flags=self.center_dq_flags,
                     snr_column="score_aper_r3_snr",
                     min_abs_snr=self.cleaned_score_min_snr,
+                    single_pixel_product="score" if self.reject_single_pixel else None,
+                    single_pixel_options=self.single_pixel_options,
                 )
             except FileNotFoundError as e:
-                SNLogger.warning(f"Skipping star rejection for score image detection; catalog not found: {file_path['score_detection_path']}")
+                SNLogger.warning(
+                    f"Skipping star rejection for score image detection; catalog not found: {file_path['score_detection_path']}"
+                )
 
         if self.save_candidates_to_database:
             catalog_path = (
@@ -1121,6 +1171,36 @@ def main():
         help="Additionally reject JUMP_DET at the source center in science, template, or product (default off).",
     )
     parser.add_argument(
+        "--reject-single-pixel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject concentrated input-image sources from cleaned catalogs (default on).",
+    )
+    parser.add_argument(
+        "--single-pixel-min-input-snr",
+        type=float,
+        default=DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
+        help="Minimum input-image r=3 S/N for the single-pixel cut (default %(default)s).",
+    )
+    parser.add_argument(
+        "--single-pixel-min-r2-r3",
+        type=float,
+        default=DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
+        help="Minimum input-image r=2/r=3 flux ratio for rejection (default %(default)s).",
+    )
+    parser.add_argument(
+        "--single-pixel-min-peak-r3",
+        type=float,
+        default=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
+        help="Minimum input-image peak/r=3 flux ratio for rejection (default %(default)s).",
+    )
+    parser.add_argument(
+        "--single-pixel-area-atol",
+        type=float,
+        default=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
+        help="Allowed absolute difference from full aperture area in pixels squared (default %(default)s).",
+    )
+    parser.add_argument(
         "--cross-convolve",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -1361,6 +1441,11 @@ def main():
         reject_center_jump_det=args.reject_center_jump_det,
         bad_pixel_columns=args.bad_pixel_columns,
         center_flag_columns=args.center_flag_columns,
+        reject_single_pixel=args.reject_single_pixel,
+        single_pixel_min_input_snr=args.single_pixel_min_input_snr,
+        single_pixel_min_r2_r3=args.single_pixel_min_r2_r3,
+        single_pixel_min_peak_r3=args.single_pixel_min_peak_r3,
+        single_pixel_area_atol=args.single_pixel_area_atol,
         detection_kwargs=detection_kwargs,
         input_star_catalog_path=args.star_catalog,
         resample_method=args.resample_method,

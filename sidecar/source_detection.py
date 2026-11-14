@@ -12,6 +12,68 @@ from snappl.logger import SNLogger
 
 DEFAULT_APERTURE_RADII = (2.0, 3.0, 5.0)
 DEFAULT_BACKGROUND_RADII = (8.0, 12.0)
+DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR = 5.0
+DEFAULT_SINGLE_PIXEL_MIN_R2_R3 = 0.95
+DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3 = 0.7
+DEFAULT_SINGLE_PIXEL_AREA_ATOL = 0.1
+
+
+def _single_pixel_suspects(
+    catalog,
+    product,
+    min_input_snr=DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
+    min_r2_r3=DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
+    min_peak_r3=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
+    area_atol=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
+):
+    """Identify concentrated input-image measurements and rows that cannot be assessed."""
+    for name, value in (
+        ("min_input_snr", min_input_snr),
+        ("min_r2_r3", min_r2_r3),
+        ("min_peak_r3", min_peak_r3),
+        ("area_atol", area_atol),
+    ):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+
+    def values(column):
+        return np.ma.filled(np.ma.asarray(catalog[column], dtype=float), np.nan)
+
+    peak = values("peak_value")
+    product_snr = values(f"{product}_aper_r3_snr")
+    positive = peak > 0
+    sign_consistent = (
+        np.isfinite(peak)
+        & np.isfinite(product_snr)
+        & (((peak > 0) & (product_snr > 0)) | ((peak < 0) & (product_snr < 0)))
+    )
+
+    def input_values(suffix):
+        return np.where(positive, values(f"science_{suffix}"), values(f"template_{suffix}"))
+
+    flux2 = input_values("aper_r2_flux")
+    flux3 = input_values("aper_r3_flux")
+    input_snr = input_values("aper_r3_snr")
+    input_peak = input_values("peak")
+    full_area = np.ones(len(catalog), dtype=bool)
+    for radius in (2, 3, 5):
+        area = input_values(f"aper_r{radius}_npix_valid")
+        full_area &= np.isclose(area, np.pi * radius**2, atol=area_atol)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        flux_ratio = flux2 / flux3
+        peak_ratio = input_peak / flux3
+    measurable = (
+        sign_consistent
+        & full_area
+        & np.isfinite(input_snr)
+        & (input_snr >= min_input_snr)
+        & np.isfinite(flux3)
+        & (flux3 > 0)
+        & np.isfinite(flux_ratio)
+        & np.isfinite(peak_ratio)
+    )
+    suspect = measurable & (flux_ratio >= min_r2_r3) & (peak_ratio >= min_peak_r3)
+    return suspect, measurable
 
 
 def detect_sources_in_subtraction(

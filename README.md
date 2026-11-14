@@ -145,6 +145,17 @@ sidecar/examples/perlmutter/test_sidecar_asdf_manualrdm.sh
   `--bad-pixel-columns science_flags_npix_bad flags_npix_bad` checks science and the product.
   Supplying `--bad-pixel-columns` without names disables the aperture bad-pixel cut in both catalogs;
   `--center-flag-columns` requires at least one name.
+  All three cleaned catalogs also reject candidate single-pixel artifacts by default. For positive
+  detections the cut uses the science measurements; for negative detections it uses the template.
+  A candidate is rejected when its input-image r=3 S/N is at least 5, r=2/r=3 flux is at least 0.95,
+  and peak/r=3 flux is at least 0.7. The peak is the maximum pixel within the r=2 aperture, after
+  subtracting the local background. These limits can be changed with `--single-pixel-min-input-snr`,
+  `--single-pixel-min-r2-r3`, and `--single-pixel-min-peak-r3`, respectively. The r=2, 3, and 5
+  input apertures must have their full area to within `--single-pixel-area-atol` (default 0.1 square
+  pixels); the detection peak and r=3 S/N must have the same sign. Candidates with incomplete,
+  nonfinite, low-S/N, or sign-inconsistent measurements are retained and logged as inconclusive.
+  Disable the cut with `--no-reject-single-pixel`. These thresholds were explored on one field and
+  one SN candidate and should be validated against real sources, PSF variations, and injected sources.
 - Truth Retrieval: Retrieve truth tables of the science image and template image.
 - Truth Matching: Match the truth information to the detected sources for evaluating efficiency. Match the detected sources to truth for evaluating purity.
 - Evaluation: Evaluate efficiency and purity.
