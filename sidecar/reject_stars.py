@@ -6,6 +6,7 @@ from sidecar.star_retrieval import read_star_catalog
 from sidecar.util import DEFAULT_STAR_MAG_COL, reject_stars
 from snappl.logger import SNLogger
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Remove sources within a (magnitude-dependent) radius of reference stars from an ECSV catalog.  "

@@ -639,9 +639,7 @@ class Pipeline:
             is not modelled by the SFFT decorrelation).
         """
         self.pre_smooth_sigma = pre_smooth_sigma
-        self.pre_smooth_kernel = (
-            _gaussian_smoothing_kernel(pre_smooth_sigma) if pre_smooth_sigma is not None else None
-        )
+        self.pre_smooth_kernel = _gaussian_smoothing_kernel(pre_smooth_sigma) if pre_smooth_sigma is not None else None
         self.resample_method = resample_method
         self.sfft_kwargs = sfft_kwargs or {}
         self.detection_kwargs = detection_kwargs or {}

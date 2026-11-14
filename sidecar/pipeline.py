@@ -658,7 +658,9 @@ class Detection:
                     "science": science_image,
                 },
                 catalog_save_path=file_path["difference_detection_path"],
-                detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["difference_image_path"])},
+                detect_kwargs={
+                    "coverage_mask": self.__class__.load_no_coverage_mask(file_path["difference_image_path"])
+                },
             )
         except Exception as e:
             SNLogger.error(f"Error during diffim detection: {e}")
