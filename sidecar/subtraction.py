@@ -55,13 +55,12 @@ def _filter_variance_with_kernel(variance, kernel):
     return variance
 
 
-def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags, allow_nan=False):
+def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags, reject_nonfinite=True):
     """Interpolate over bad pixels in an image.
 
     Bad pixels are identified based on the provided `bad_pixel_flags`.
     The function replaces bad pixel values with interpolated values
-    By default it also interpolates over NaN values in the input data.
-
+    By default it also interpolates over nonfinite values (NaN and inf) in the input data.
     Parameters
     ----------
     data : ndarray
@@ -70,9 +69,11 @@ def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags, al
         Image flags indicating bad pixels.
     bad_pixel_flags : int, optional
         Bitwise combination of DQ flags used to identify bad pixels.
-    allow_nan : bool, optional
-        If True, NaN values in the input data are also interpolated over.
-        If False (default), NaN values are treated as bad pixels.
+    reject_nonfinite : bool, optional
+        If True (default), nonfinite values (NaN and inf) in the input data are also interpolated over.
+        If False, NaN values are treated as bad pixels but inf is allowed.
+        I'm not sure exactly when one would want to do this, but in principle inf is the correct value
+        for a saturated or otherwise unusable pixel, so maybe one would want to keep those in some cases.
 
     Returns
     -------
@@ -92,14 +93,14 @@ def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags, al
     # Create a mask of bad pixels based on the flags
     bad_mask = (flags & bad_pixel_flags) > 0
 
-    if not allow_nan:
-        # Add NaN values to the bad pixel mask
-        bad_mask |= np.isnan(data)
+    if reject_nonfinite:
+        # Add nonfinite values to the bad pixel mask
+        bad_mask |= ~np.isfinite(data)
 
     interpolated_data = data.copy()
     interpolated_data[bad_mask] = np.nan  # Mark bad pixels as NaN for interpolation
 
-    # Example interpolation using nearest neighbor
+    # Interpolation using nearest neighbor
     x, y = np.indices(data.shape)
     good_pixels = ~bad_mask
     interpolated_data[bad_mask] = griddata(
