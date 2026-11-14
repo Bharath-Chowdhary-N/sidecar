@@ -288,7 +288,9 @@ def main():
         star_mag_col=args.star_mag_column,
     )
     write_candidates(candidates, args.output, args.region_file)
-    SNLogger.info(f"Wrote {len(candidates)} of {len(nested)} objects to {args.output} (noise {candidates.attrs.get('noise')})")
+    SNLogger.info(
+        f"Wrote {len(candidates)} of {len(nested)} objects to {args.output} (noise {candidates.attrs.get('noise')})"
+    )
 
 
 if __name__ == "__main__":

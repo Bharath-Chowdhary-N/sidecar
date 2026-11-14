@@ -598,7 +598,9 @@ class Detection:
             sfft_kwargs=self.sfft_kwargs,
             pre_smooth_sigma=self.pre_smooth_sigma,
         )
+        SNLogger.info("Finished subtraction")
 
+        SNLogger.info("Finding and measuring sources")
         # One star catalog serves both source selection for SFFT and rejecting candidates.
         gaia_mag_limit = self.detection_kwargs.get("gaia_mag_limit", subtraction.DEFAULT_GAIA_MAG_LIMIT)
         stars = None
@@ -646,29 +648,35 @@ class Detection:
                 )
                 simple_detection_exists = True
 
-        SNLogger.info("Processing diffim detection")
-        detect_and_measure_sources(
-            detection_image=difference_image,
-            measurement_images={
-                "diff": difference_image,
-                "template": template_image,
-                "science": science_image,
-            },
-            catalog_save_path=file_path["difference_detection_path"],
-            detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["difference_image_path"])},
-        )
+        try:
+            SNLogger.info("Processing diffim detection")
+            detect_and_measure_sources(
+                detection_image=difference_image,
+                measurement_images={
+                    "diff": difference_image,
+                    "template": template_image,
+                    "science": science_image,
+                },
+                catalog_save_path=file_path["difference_detection_path"],
+                detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["difference_image_path"])},
+            )
+        except Exception as e:
+            SNLogger.error(f"Error during diffim detection: {e}")
 
-        SNLogger.info("Processing score image detection")
-        detect_and_measure_sources(
-            detection_image=score_image,
-            measurement_images={
-                "score": score_image,
-                "template": template_image,
-                "science": science_image,
-            },
-            catalog_save_path=file_path["score_detection_path"],
-            detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["score_image_path"])},
-        )
+        try:
+            SNLogger.info("Processing score image detection")
+            detect_and_measure_sources(
+                detection_image=score_image,
+                measurement_images={
+                    "score": score_image,
+                    "template": template_image,
+                    "science": science_image,
+                },
+                catalog_save_path=file_path["score_detection_path"],
+                detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["score_image_path"])},
+            )
+        except Exception as e:
+            SNLogger.error(f"Error during score image detection: {e}")
 
         if reject_known_stars:
             if simple_detection_exists:
