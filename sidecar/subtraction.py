@@ -55,8 +55,12 @@ def _filter_variance_with_kernel(variance, kernel):
     return variance
 
 
-def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags):
+def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags, allow_nan=False):
     """Interpolate over bad pixels in an image.
+
+    Bad pixels are identified based on the provided `bad_pixel_flags`.
+    The function replaces bad pixel values with interpolated values
+    By default it also interpolates over NaN values in the input data.
 
     Parameters
     ----------
@@ -66,6 +70,9 @@ def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags):
         Image flags indicating bad pixels.
     bad_pixel_flags : int, optional
         Bitwise combination of DQ flags used to identify bad pixels.
+    allow_nan : bool, optional
+        If True, NaN values in the input data are also interpolated over.
+        If False (default), NaN values are treated as bad pixels.
 
     Returns
     -------
@@ -84,6 +91,10 @@ def interpolate_over_bad_pixels(data, flags, bad_pixel_flags=bad_pixel_flags):
     """
     # Create a mask of bad pixels based on the flags
     bad_mask = (flags & bad_pixel_flags) > 0
+
+    if not allow_nan:
+        # Add NaN values to the bad pixel mask
+        bad_mask |= np.isnan(data)
 
     interpolated_data = data.copy()
     interpolated_data[bad_mask] = np.nan  # Mark bad pixels as NaN for interpolation
@@ -739,12 +750,16 @@ class Pipeline:
         self.template_image._data, template_image_interpolated_mask = interpolate_over_bad_pixels(
             self.template_image.data, self.template_image.flags, bad_pixel_flags=bad_pixel_flags
         )
+        # The Roman datamodel noise arrays are 16-bit floats
+        # We recast to 32-bit floats to avoid floating-point overflow when squaring to create variance arrays
         science_noise, _ = interpolate_over_bad_pixels(
             self.science_image.noise, self.science_image.flags, bad_pixel_flags=bad_pixel_flags
         )
+        science_noise = np.asarray(science_noise, dtype=np.float32)
         template_noise, _ = interpolate_over_bad_pixels(
             self.template_image.noise, self.template_image.flags, bad_pixel_flags=bad_pixel_flags
         )
+        template_noise = np.asarray(template_noise, dtype=np.float32)
 
         # sky subtraction and source detection
         science_skysubim_data, science_detmask_data, science_skyrms, _, _ = sky_subtract_and_detect(
