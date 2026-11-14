@@ -694,25 +694,34 @@ class Detection:
                 )
 
             SNLogger.info("Removing known stars from diffim image detection")
-            _ = self.__class__.reject_stars(
-                stars,
-                file_path["difference_detection_path"],
-                self.REJECT_MATCH_RADIUS,
-                file_path["cleaned_difference_detection_path"],
-            )
+            # We use a try/except here instead of figuring out the right way to check
+            # both POSIX (os.path.exists) and S3 (s3fs) paths for existence.
+            # If the catalog doesn't exist, we just skip the star rejection.
+            try:
+                _ = self.__class__.reject_stars(
+                    stars,
+                    file_path["difference_detection_path"],
+                    self.REJECT_MATCH_RADIUS,
+                    file_path["cleaned_difference_detection_path"],
+                )
+            except FileNotFoundError as e:
+                SNLogger.warning(f"Skipping star rejection for diffim detection; catalog not found: {file_path['difference_detection_path']}")
 
             SNLogger.info("Removing known stars from score image detection")
-            _ = self.__class__.reject_stars(
-                stars,
-                file_path["score_detection_path"],
-                self.REJECT_MATCH_RADIUS,
-                file_path["cleaned_score_detection_path"],
-                bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "score"),
-                center_flag_columns=_product_flag_columns(self.center_flag_columns, "score"),
-                center_dq_flags=self.center_dq_flags,
-                snr_column="score_aper_r3_snr",
-                min_abs_snr=self.cleaned_score_min_snr,
-            )
+            try:
+                _ = self.__class__.reject_stars(
+                    stars,
+                    file_path["score_detection_path"],
+                    self.REJECT_MATCH_RADIUS,
+                    file_path["cleaned_score_detection_path"],
+                    bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "score"),
+                    center_flag_columns=_product_flag_columns(self.center_flag_columns, "score"),
+                    center_dq_flags=self.center_dq_flags,
+                    snr_column="score_aper_r3_snr",
+                    min_abs_snr=self.cleaned_score_min_snr,
+                )
+            except FileNotFoundError as e:
+                SNLogger.warning(f"Skipping star rejection for score image detection; catalog not found: {file_path['score_detection_path']}")
 
         if self.save_candidates_to_database:
             catalog_path = (
