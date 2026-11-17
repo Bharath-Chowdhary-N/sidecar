@@ -13,12 +13,13 @@ from snappl.logger import SNLogger
 DEFAULT_APERTURE_RADII = (2.0, 3.0, 5.0)
 DEFAULT_BACKGROUND_RADII = (8.0, 12.0)
 DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR = 5.0
+# Consider generalizing the radii for the flux ratio, rather than hardcoding 2 and 3 into the names.
 DEFAULT_SINGLE_PIXEL_MIN_R2_R3 = 0.95
 DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3 = 0.7
 DEFAULT_SINGLE_PIXEL_AREA_ATOL = 0.1
 
 
-def _single_pixel_suspects(
+def find_single_pixel_suspects(
     catalog,
     product,
     min_input_snr=DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,

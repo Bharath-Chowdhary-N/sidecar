@@ -25,7 +25,7 @@ from sidecar.source_detection import (
     DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
     DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
     DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
-    _single_pixel_suspects,
+    find_single_pixel_suspects,
     detect_and_measure_sources,
 )
 from sidecar import util
@@ -347,7 +347,7 @@ class Detection:
             Product column prefix, e.g. "diff", enabling the input-image concentration cut.
             Rows that cannot be assessed are retained.
         single_pixel_options : dict, optional
-            Thresholds passed to `_single_pixel_suspects`.
+            Thresholds passed to `find_single_pixel_suspects`.
         radius_kwargs :
             ref_mag, scale, max_radius, mag_col for a magnitude-dependent radius; see util.reject_stars
 
@@ -393,7 +393,7 @@ class Detection:
             cleaned_detection = cleaned_detection[good]
 
         if single_pixel_product is not None:
-            suspects, measurable = _single_pixel_suspects(
+            suspects, measurable = find_single_pixel_suspects(
                 cleaned_detection, single_pixel_product, **(single_pixel_options or {})
             )
             SNLogger.info(f"Removing {np.count_nonzero(suspects)} concentrated single-pixel candidates")
