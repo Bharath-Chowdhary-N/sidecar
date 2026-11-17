@@ -412,7 +412,7 @@ def sky_subtract_and_detect(
 
     # Grow individual pixels by bad_mask_radius
     bad_mask_footprint = circular_footprint(radius=bad_mask_radius)
-    convolved_bad_mask = convolve2d(bad_mask, bad_mask_footprint, fillvalue=0, mode="same")
+    convolved_bad_mask = convolve2d(bad_mask, bad_mask_footprint, fillvalue=0, mode="same") > 0
 
     detection_footprint = circular_footprint(radius=footprint_radius)
     segment_img = detect_sources(
