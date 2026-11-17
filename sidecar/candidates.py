@@ -12,7 +12,7 @@ Example
 Cuts (all configurable), on median values over an object's sources:
 
 1. at least ``min_sources`` detections in at least ``min_bands`` bands;
-2. |z| >= ``min_abs_z``, with z = diff flux / noise, and at least ``min_sign_consistency`` of
+2. |snr| >= ``min_abs_snr``, with snr = diff flux / noise, and at least ``min_sign_consistency`` of
    the detections having the sign of the median;
 3. the science - template flux has the sign of the diff flux in at least
    ``min_sign_agreement`` of the detections, and |science - template| >= ``min_frac_change``
@@ -20,7 +20,7 @@ Cuts (all configurable), on median values over an object's sources:
 4. the brighter median flux lies in ``flux_range``;
 5. not within a magnitude-dependent radius of a reference (Gaia) star, if a star catalog is given
    (the same rule as `sidecar.reject_stars`); applied before the isolation cut;
-6. isolation: no other object passing cuts 1 and 2 (|z| and detection count) within
+6. isolation: no other object passing cuts 1 and 2 (|snr| and detection count) within
    ``isolation_radius``.
 """
 
@@ -36,7 +36,7 @@ from snappl.logger import SNLogger
 DEFAULT_NOISE = 0.21  # empirical scatter of the diff r3 flux on empty sky in program 01062
 STAT_COLUMNS = (
     "n_band",
-    "z_med",
+    "snr_med",
     "sign_consistency",
     "sign_agreement",
     "sci_flux_med",
@@ -97,7 +97,7 @@ def add_object_statistics(nested, noise=DEFAULT_NOISE, aperture="r3", diff_prefi
 
     stats = pd.DataFrame(index=med.index)
     stats["n_band"] = grouped["band"].nunique()
-    stats["z_med"] = med["diff"] / noise
+    stats["snr_med"] = med["diff"] / noise
     stats["sign_consistency"] = grouped["same_sign"].mean()
     stats["sign_agreement"] = grouped["agrees"].mean()
     stats["sci_flux_med"] = med["sci"]
@@ -149,7 +149,7 @@ def select_candidates(
     nested,
     min_sources=5,
     min_bands=3,
-    min_abs_z=4.0,
+    min_abs_snr=4.0,
     min_sign_consistency=0.85,
     min_sign_agreement=0.8,
     min_frac_change=0.5,
@@ -182,7 +182,7 @@ def select_candidates(
         )
     stats = add_object_statistics(nested, noise=noise, aperture=aperture, diff_prefix=diff_prefix)
 
-    detected = (stats["n_sources"] >= min_sources) & (stats["z_med"].abs() >= min_abs_z)
+    detected = (stats["n_sources"] >= min_sources) & (stats["snr_med"].abs() >= min_abs_snr)
     keep = (
         detected
         & (stats["n_band"] >= min_bands)
@@ -211,9 +211,9 @@ def write_candidates(candidates, path, region_file=None):
     if region_file is not None:
         with open(region_file, "w") as f:
             f.write("# Candidates from sidecar.candidates\nfk5\n")
-            for _, row in candidates.sort_values("z_med", key=abs, ascending=False).iterrows():
-                color = "green" if row["z_med"] > 0 else "red"
-                f.write(f'circle({row["ra"]:.7f},{row["dec"]:.7f},1") # color={color} text={{z={row["z_med"]:.1f}}}\n')
+            for _, row in candidates.sort_values("snr_med", key=abs, ascending=False).iterrows():
+                color = "green" if row["snr_med"] > 0 else "red"
+                f.write(f'circle({row["ra"]:.7f},{row["dec"]:.7f},1") # color={color} text={{z={row["snr_med"]:.1f}}}\n')
     return table
 
 
@@ -273,7 +273,7 @@ def main():
         nested,
         min_sources=args.min_sources,
         min_bands=args.min_bands,
-        min_abs_z=args.min_abs_z,
+        min_abs_snr=args.min_abs_snr,
         min_sign_consistency=args.min_sign_consistency,
         min_sign_agreement=args.min_sign_agreement,
         min_frac_change=args.min_frac_change,
