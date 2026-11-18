@@ -1,10 +1,4 @@
-"""Write catalogs as ECSV with a companion Parquet file, and read them back quickly.
-
-Parquet is much faster to read than ECSV.  `write_catalog` keeps the ECSV (the
-human-readable, canonical product) and also writes ``<same name>.parquet``
-beside it.  `read_catalog` prefers an up-to-date Parquet companion and, if
-none exists, reads the ECSV and (optionally) creates the companion as a cache.
-"""
+"""Read and write ECSV and Parquet catalogs."""
 
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -13,6 +7,7 @@ from pathlib import Path
 from astropy.table import Table
 
 PARQUET_SUFFIX = ".parquet"
+OUTPUT_FORMATS = ("ecsv", "parquet", "both")
 
 
 def parquet_path(path):
@@ -31,12 +26,28 @@ def _write_parquet(table, path):
             tmp.unlink()
 
 
-def write_catalog(table, path, overwrite=True, format="ascii.ecsv", parquet=True):
-    """Write `table` to `path` (ECSV by default) and a Parquet companion beside it."""
+def catalog_output_paths(path, output_format="parquet"):
+    """Return output paths; `both` uses the ECSV path as its primary path."""
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
     path = Path(path)
-    table.write(path, overwrite=overwrite, format=format)
-    if parquet:
-        _write_parquet(table, parquet_path(path))
+    expected = ".parquet" if output_format == "parquet" else ".ecsv"
+    if path.suffix.lower() != expected:
+        raise ValueError(f"output path {path} must end in {expected} for output format {output_format}")
+    return (path, parquet_path(path)) if output_format == "both" else (path,)
+
+
+def write_catalog(table, path, overwrite=True, output_format="parquet"):
+    """Write a Parquet, ECSV, or both-format catalog at the specified path."""
+    paths = catalog_output_paths(path, output_format)
+    if not overwrite:
+        for target in paths:
+            if target.exists():
+                raise FileExistsError(f"Catalog already exists: {target}")
+    if output_format in ("ecsv", "both"):
+        table.write(paths[0], overwrite=overwrite, format="ascii.ecsv")
+    if output_format in ("parquet", "both"):
+        _write_parquet(table, paths[-1])
 
 
 def read_catalog(path, cache=True):
@@ -51,7 +62,7 @@ def read_catalog(path, cache=True):
         the ECSV.  Failure to write (e.g. read-only directory) is ignored.
     """
     path = Path(path)
-    if path.suffix == PARQUET_SUFFIX:
+    if path.suffix.lower() == PARQUET_SUFFIX:
         return Table.read(path, format="parquet")
 
     pq = parquet_path(path)

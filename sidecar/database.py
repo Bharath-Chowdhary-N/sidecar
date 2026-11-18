@@ -1,6 +1,6 @@
 import numpy as np
 
-from astropy.table import Table
+from sidecar.catalog_io import read_catalog
 
 from snappl.config import Config
 from snappl.diaobject import DiaObject
@@ -49,13 +49,13 @@ def save_dia_objects_from_subtraction(
 ):
     """Save DIA Objects to the database
 
-    dia_source_catalog_path:  str, Path of ecsv file to load
+    dia_source_catalog_path: str, Path of ECSV or Parquet file to load
 
     threshold: float
         Significance of detection.  Cut will be abs(threshold_column) > threshold
     threshold_column: str, name of column to filter
     """
-    dia_sources = Table.read(dia_source_catalog_path, format="ascii.ecsv")
+    dia_sources = read_catalog(dia_source_catalog_path, cache=False)
     science = image_collection.get_image(observation_id=science_observation_id, sca=science_sca, band=science_band)
 
     if threshold is not None:

@@ -8,7 +8,10 @@ from astropy.table import MaskedColumn, Table
 from roman_datamodels import dqflags
 
 from sidecar import pipeline
+from sidecar import reject_stars as reject_stars_cli
+from sidecar.catalog_io import read_catalog
 from sidecar.pipeline import Detection
+from sidecar.star_retrieval import read_star_catalog
 from sidecar.util import reject_stars, star_rejection_radii
 
 
@@ -56,6 +59,77 @@ def test_empty():
     detection, stars = _tables()
     assert len(reject_stars(detection, stars[:0], 5.0)) == len(detection)
     assert len(reject_stars(detection[:0], stars, 5.0)) == 0
+
+
+@pytest.mark.parametrize("detection_format", ["ecsv", "parquet"])
+@pytest.mark.parametrize("star_format", ["ecsv", "parquet"])
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+def test_reject_stars_cli_catalog_formats(tmp_path, monkeypatch, detection_format, star_format, output_format):
+    detection, stars = _tables()
+    detection_path = tmp_path / f"detections.{detection_format}"
+    star_path = tmp_path / f"stars.{star_format}"
+    detection.write(detection_path, format="ascii.ecsv" if detection_format == "ecsv" else "parquet")
+    stars.write(star_path, format="ascii.ecsv" if star_format == "ecsv" else "parquet")
+    monkeypatch.setattr(sys, "argv", [
+        "reject_stars", str(detection_path), str(star_path), "--catalog-output-format", output_format
+    ])
+    reject_stars_cli.main()
+    ecsv = tmp_path / "cleaned_detections.ecsv"
+    parquet = tmp_path / "cleaned_detections.parquet"
+    assert ecsv.exists() == (output_format in ("ecsv", "both"))
+    assert parquet.exists() == (output_format in ("parquet", "both"))
+    output = parquet if output_format == "parquet" else ecsv
+    assert list(read_catalog(output, cache=False)["id"]) == [0, 1, 3, 5]
+
+
+def test_reject_stars_cli_rejects_conflicting_output_path(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "cleaned.ecsv"
+    monkeypatch.setattr(sys, "argv", ["reject_stars", "input.ecsv", "stars.ecsv", "-o", str(output)])
+    with pytest.raises(SystemExit) as exc:
+        reject_stars_cli.main()
+    assert exc.value.code == 2
+    assert "must end in .parquet" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_reject_stars_cli_default_parquet(tmp_path, monkeypatch):
+    detection, stars = _tables()
+    detection_path = tmp_path / "detections.ecsv"
+    star_path = tmp_path / "stars.ecsv"
+    detection.write(detection_path, format="ascii.ecsv")
+    stars.write(star_path, format="ascii.ecsv")
+    monkeypatch.setattr(sys, "argv", ["reject_stars", str(detection_path), str(star_path)])
+    reject_stars_cli.main()
+    assert list(read_catalog(tmp_path / "cleaned_detections.parquet")["id"]) == [0, 1, 3, 5]
+    assert not (tmp_path / "cleaned_detections.ecsv").exists()
+
+
+def test_read_star_catalog_parquet_and_text_compatibility(tmp_path):
+    empty = tmp_path / "empty.txt"
+    empty.write_text("  \n")
+    assert len(read_star_catalog(empty)) == 0
+
+    text = tmp_path / "stars.txt"
+    text.write_text("ra dec phot_g_mean_mag\n10.0 0.0 18.0\n")
+    assert len(read_star_catalog(text)) == 1
+
+    parquet = tmp_path / "stars.PARQUET"
+    Table({"ra": [10.0], "dec": [0.0], "phot_g_mean_mag": [18.0]}).write(parquet, format="parquet")
+    assert list(read_star_catalog(parquet)["ra"]) == [10.0]
+    assert list(read_catalog(parquet)["ra"]) == [10.0]
+
+    empty_parquet = tmp_path / "empty.parquet"
+    Table(names=["ra", "dec"], dtype=[float, float]).write(empty_parquet, format="parquet")
+    assert len(read_star_catalog(empty_parquet)) == 0
+
+    missing = tmp_path / "missing.parquet"
+    Table({"ra": [10.0]}).write(missing, format="parquet")
+    with pytest.raises(ValueError, match="missing required columns.*dec"):
+        read_star_catalog(missing)
+    corrupt = tmp_path / "corrupt.parquet"
+    corrupt.write_bytes(b"not a parquet file")
+    with pytest.raises((ValueError, OSError)):
+        read_star_catalog(corrupt)
 
 
 def test_clean_score_bad_pixels_and_absolute_snr(tmp_path):
@@ -299,6 +373,8 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
             "0.8",
             "--single-pixel-area-atol",
             "0.2",
+            "--catalog-output-format",
+            "ecsv",
         ]
     elif mode == "empty":
         args += ["--bad-pixel-columns", "--reject-center-jump-det"]
@@ -309,6 +385,7 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
         assert detection.bad_pixel_columns == ["science_flags_npix_bad", "flags_npix_bad"]
         assert detection.center_flag_columns == ["template_flags_center", "flags_center"]
         assert detection.center_dq_flags == 4
+        assert detection.output_format == "ecsv"
         assert not detection.reject_single_pixel
         assert detection.single_pixel_options == {
             "min_input_snr": 8,
@@ -324,9 +401,31 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
         assert detection.center_flag_columns == ["template_flags_center", "science_flags_center", "flags_center"]
         assert detection.center_dq_flags == 0
         assert detection.reject_single_pixel
+        assert detection.output_format == "parquet"
 
 
-def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+def test_pipeline_output_paths_follow_format(monkeypatch, tmp_path, output_format):
+    class TestConfig:
+        def value(self, key, default=None):
+            if key == "system.ou24.tds_base":
+                raise ValueError("not configured")
+            return default
+
+    monkeypatch.setattr(pipeline.Config, "get", lambda: TestConfig())
+    instance = Detection(None, [], temp_dir=tmp_path, output_dir=tmp_path, output_format=output_format)
+    science = {"band": "F062", "observation_id": 1, "sca": 1}
+    template = {"band": "F062", "observation_id": 2, "sca": 1}
+    paths = instance.path_helper(science, template, science_image_path="science", template_image_path="template")
+    suffix = ".parquet" if output_format == "parquet" else ".ecsv"
+    for key in ("star_catalog_path", "difference_truth_path", "difference_detection_path",
+                "cleaned_score_detection_path", "transients_to_detection_path"):
+        assert paths[key].suffix == suffix
+    assert paths["difference_image_path"].suffix == ".fits"
+
+
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, output_format):
     class TestConfig:
         def value(self, key, default=None):
             if key == "system.ou24.tds_base":
@@ -352,6 +451,10 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
         )
     }
     paths["simple_difference_image_path"].touch()
+    suffix = ".parquet" if output_format == "parquet" else ".ecsv"
+    for key in paths:
+        if "detection_path" in key:
+            paths[key] = paths[key].with_suffix(suffix)
     stars = Table({"ra": [], "dec": []})
     monkeypatch.setattr(pipeline.star_retrieval, "read_star_catalog", lambda path: stars)
     monkeypatch.setattr(pipeline.subtraction, "Pipeline", lambda **kwargs: SimpleNamespace(detection_kwargs={}))
@@ -387,7 +490,9 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
     monkeypatch.setattr(
         pipeline,
         "detect_and_measure_sources",
-        lambda **kwargs: detections.write(kwargs["catalog_save_path"], format="ascii.ecsv", overwrite=True),
+        lambda **kwargs: pipeline.write_catalog(
+            detections, kwargs["catalog_save_path"], output_format=kwargs["output_format"]
+        ),
     )
     instance = Detection(
         image_collection=None,
@@ -399,6 +504,7 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
         center_dq_flags=4,
         bad_pixel_columns=["science_flags_npix_bad", "flags_npix_bad"],
         center_flag_columns=["template_flags_center", "flags_center"],
+        output_format=output_format,
     )
     instance.run_one_subtraction(
         SimpleNamespace(get_image=lambda path: object()),
@@ -410,9 +516,9 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
         1,
         assume_subtraction_has_been_run=True,
     )
-    assert list(Table.read(paths["cleaned_score_detection_path"], format="ascii.ecsv")["id"]) == [0]
-    assert list(Table.read(paths["cleaned_simple_difference_detection_path"], format="ascii.ecsv")["id"]) == [0]
-    assert list(Table.read(paths["cleaned_difference_detection_path"], format="ascii.ecsv")["id"]) == [0, 1]
+    assert list(read_catalog(paths["cleaned_score_detection_path"], cache=False)["id"]) == [0]
+    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"], cache=False)["id"]) == [0]
+    assert list(read_catalog(paths["cleaned_difference_detection_path"], cache=False)["id"]) == [0, 1]
     instance.reject_single_pixel = False
     instance.run_one_subtraction(
         SimpleNamespace(get_image=lambda path: object()),
@@ -424,5 +530,5 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path):
         1,
         assume_subtraction_has_been_run=True,
     )
-    assert list(Table.read(paths["cleaned_simple_difference_detection_path"], format="ascii.ecsv")["id"]) == [0, 2]
-    assert list(Table.read(paths["cleaned_difference_detection_path"], format="ascii.ecsv")["id"]) == [0, 1, 2]
+    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"], cache=False)["id"]) == [0, 2]
+    assert list(read_catalog(paths["cleaned_difference_detection_path"], cache=False)["id"]) == [0, 1, 2]

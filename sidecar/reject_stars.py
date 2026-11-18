@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from sidecar.catalog_io import read_catalog, write_catalog
+from sidecar.catalog_io import OUTPUT_FORMATS, catalog_output_paths, read_catalog, write_catalog
 from sidecar.star_retrieval import read_star_catalog
 from sidecar.util import DEFAULT_STAR_MAG_COL, reject_stars
 from snappl.logger import SNLogger
@@ -9,13 +9,18 @@ from snappl.logger import SNLogger
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove sources within a (magnitude-dependent) radius of reference stars from an ECSV catalog.  "
+        description="Remove sources within a (magnitude-dependent) radius of reference stars from a catalog.  "
         "Stars brighter than --ref-mag are rejected within radius = match_radius * 10**(scale * (ref_mag - mag)), "
         "capped at --max-radius; all other stars use --match-radius."
     )
-    parser.add_argument("catalog", type=str, help="ECSV catalog with ra, dec columns in degrees")
-    parser.add_argument("star_catalog", type=str, help="Reference star ECSV (e.g., Gaia) with ra, dec, magnitude")
-    parser.add_argument("-o", "--output", type=str, default=None, help="Output ECSV.  Default: cleaned_<catalog name>")
+    parser.add_argument("catalog", type=str, help="ECSV or Parquet catalog with ra, dec columns in degrees")
+    parser.add_argument("star_catalog", type=str, help="Reference star ECSV or Parquet with ra, dec, magnitude")
+    parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Output catalog path. Default: cleaned_<catalog stem> with the appropriate extension.",
+    )
+    parser.add_argument("--catalog-output-format", choices=OUTPUT_FORMATS, default="parquet",
+                        help="Output format (default: %(default)s); both uses an ECSV output path.")
     parser.add_argument("--match-radius", type=float, default=5.0, help="Base rejection radius in arcsec")
     parser.add_argument("--ref-mag", type=float, default=None, help="Stars brighter than this get a larger radius")
     parser.add_argument("--scale", type=float, default=0.2, help="Radius grows as 10**(scale * (ref_mag - mag))")
@@ -29,7 +34,12 @@ def main():
     args = parser.parse_args()
 
     catalog_path = Path(args.catalog)
-    output = args.output or str(catalog_path.with_name("cleaned_" + catalog_path.name))
+    suffix = ".parquet" if args.catalog_output_format == "parquet" else ".ecsv"
+    output = Path(args.output) if args.output else catalog_path.with_name("cleaned_" + catalog_path.stem + suffix)
+    try:
+        output_paths = catalog_output_paths(output, args.catalog_output_format)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     detection = read_catalog(catalog_path, cache=False)
     stars = read_star_catalog(args.star_catalog)
@@ -47,8 +57,8 @@ def main():
         scale=args.scale,
         max_radius=args.max_radius,
     )
-    write_catalog(cleaned, output, overwrite=True)
-    SNLogger.info(f"Kept {len(cleaned)} of {len(detection)} sources; wrote {output}")
+    write_catalog(cleaned, output, overwrite=True, output_format=args.catalog_output_format)
+    SNLogger.info(f"Kept {len(cleaned)} of {len(detection)} sources; wrote {', '.join(map(str, output_paths))}")
 
 
 if __name__ == "__main__":

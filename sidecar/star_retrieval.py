@@ -5,32 +5,37 @@ import astropy.units as u
 from astropy.table import Table
 from astroquery.gaia import Gaia
 
+from sidecar.catalog_io import read_catalog
+
 GAIA_SOURCE_TABLE = "gaiadr3.gaia_source"
 STAR_COLUMNS = ("ra", "dec", "phot_g_mean_mag")
 
 
 def read_star_catalog(path):
-    """Read a previously saved star catalog from a text file, so no network access is needed.
+    """Read a previously saved star catalog, so no network access is needed.
 
     Parameters
     ----------
     path : str or pathlib.Path
-        ECSV (e.g., from `python -m sidecar.star_retrieval`) or other astropy-readable text table
-        with at least 'ra' and 'dec' columns in degrees (ICRS), and 'phot_g_mean_mag' for magnitude cuts.
-        An empty file, or a table with no rows, gives an empty catalog.
+        ECSV, Parquet, or other astropy-readable text table with at least 'ra'
+        and 'dec' columns in degrees (ICRS), and 'phot_g_mean_mag' for magnitude cuts.
+        An empty text file, or a table with no rows, gives an empty catalog.
 
     Returns
     -------
     astropy.table.Table
     """
     path = Path(path)
-    if not path.read_text().strip():
+    if path.suffix.lower() != ".parquet" and not path.read_text().strip():
         return Table(names=STAR_COLUMNS, dtype=(float,) * len(STAR_COLUMNS))
 
-    try:
-        stars = Table.read(path, format="ascii.ecsv")
-    except ValueError:
-        stars = Table.read(path, format="ascii")
+    if path.suffix.lower() == ".parquet":
+        stars = read_catalog(path, cache=False)
+    else:
+        try:
+            stars = read_catalog(path, cache=False)
+        except ValueError:
+            stars = Table.read(path, format="ascii")
 
     if len(stars) > 0:
         missing = {"ra", "dec"} - set(stars.colnames)

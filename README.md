@@ -156,6 +156,14 @@ sidecar/examples/perlmutter/test_sidecar_asdf_manualrdm.sh
   nonfinite, low-S/N, or sign-inconsistent measurements are retained and logged as inconclusive.
   Disable the cut with `--no-reject-single-pixel`. These thresholds were explored on one field and
   one SN candidate and should be validated against real sources, PSF variations, and injected sources.
+- Standalone star rejection accepts ECSV or Parquet for both detections and reference stars:
+  `python -m sidecar.reject_stars detections.parquet stars.ecsv`. Both this command and
+  `sidecar.pipeline` accept `--catalog-output-format parquet|ecsv|both` (default `parquet`) for catalog
+  outputs. `both` writes ECSV and a Parquet companion with the same stem; the ECSV path is
+  the primary path. For standalone star rejection, `--output` must have the `.parquet` extension
+  for `parquet`, or `.ecsv` for `ecsv` and `both`. Without `--output`, the name is
+  `cleaned_<input stem>` with the appropriate extension. Pipeline truth, detection, star, cleaned,
+  and matching catalogs use the selected format; FITS images are unaffected.
 - Truth Retrieval: Retrieve truth tables of the science image and template image.
 - Truth Matching: Match the truth information to the detected sources for evaluating efficiency. Match the detected sources to truth for evaluating purity.
 - Evaluation: Evaluate efficiency and purity.

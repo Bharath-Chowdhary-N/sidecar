@@ -51,7 +51,8 @@ def _write_product(path, data, wcs, noise=None, flags=None):
     return FITSImage(path, imagehdu=1, noisehdu=2, flagshdu=3, no_base_path=True)
 
 
-def test_measure_sources_recovers_flux_and_flags(tmp_path):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+def test_measure_sources_recovers_flux_and_flags(tmp_path, output_format):
     wcs = _wcs()
     sources = [(50, 60, 800.0), (140, 120, -600.0)]
     data = _image(sources)
@@ -64,10 +65,13 @@ def test_measure_sources_recovers_flux_and_flags(tmp_path):
     diff = _write_product(path, data, wcs, noise=noise, flags=flags)
     other = _write_product(tmp_path / "other.fits", data, wcs)
     images = {"diff": diff, "other": other}
-    out_path = tmp_path / "det.ecsv"
-    cat = detect_and_measure_sources(diff, images, out_path, bad_pixel_flags=2**3)
+    out_path = tmp_path / ("det.parquet" if output_format == "parquet" else "det.ecsv")
+    cat = detect_and_measure_sources(diff, images, out_path, bad_pixel_flags=2**3, output_format=output_format)
 
     assert out_path.exists()
+    assert (tmp_path / "det.ecsv").exists() == (output_format in ("ecsv", "both"))
+    assert (tmp_path / "det.parquet").exists() == (output_format in ("parquet", "both"))
+    assert len(Table.read(out_path)) == len(cat)
     assert len(cat) >= 2
     for x, y, flux in sources:
         row = cat[np.argmin(np.hypot(cat["x_centroid"] - x, cat["y_centroid"] - y))]
