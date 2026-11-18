@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
 
+from sidecar.catalog_io import read_catalog, write_catalog
 from snappl.dbclient import SNPITDBClient
 from snappl.imagecollection import ImageCollection
 
@@ -532,8 +534,8 @@ def read_data_records(data_records_path):
     return df
 
 
-def write_ds9_regions_from_ecsv(
-    ecsv_catalog_path,
+def write_ds9_regions_from_catalog(
+    catalog_path,
     ds9_region_path="ds9.reg",
     peak_value_threshold=100,
     ra_column="ra",
@@ -547,8 +549,8 @@ def write_ds9_regions_from_ecsv(
 
     Parameters
     ----------
-    ecsv_catalog_path : str or pathlib.Path
-        Path to the input ECSV catalog.
+    catalog_path : str or pathlib.Path
+        Path to the input catalog (ECSV or Parquet, chosen by suffix).
     ds9_region_path : str or pathlib.Path
         Output DS9 region file path.
     peak_value_threshold : float
@@ -571,7 +573,7 @@ def write_ds9_regions_from_ecsv(
     astropy.table.Table
         Filtered `astropy.table.Table` containing only rows with
         `peak_value` greater than `peak_value_threshold`. The returned table
-        preserves the original catalog columns in the `ecsv_catalog_path` file.
+        preserves the original catalog columns in the `catalog_path` file.
 
     Notes
     -----
@@ -579,7 +581,7 @@ def write_ds9_regions_from_ecsv(
     or if peak_value_threshold is None,
     then all sources are written to the DS9 region file.
     """
-    catalog = Table.read(ecsv_catalog_path, format="ascii.ecsv")
+    catalog = read_catalog(catalog_path, cache=False)
 
     # Normalize the CLI-style "none" string once so the rest only checks for None.
     # if peak_value_column is already None, then this preserves that (by doing nothing).
@@ -614,6 +616,53 @@ def write_ds9_regions_from_ecsv(
             region_file.write(line + "\n")
 
     return catalog[mask]
+
+
+def filter_catalog_by_abs_threshold(
+    catalog_path, column, threshold, output_path=None, prefix="filtered_", min_inclusive=True
+):
+    """Keep catalog rows where ``abs(column)`` is finite and at least ``threshold``.
+
+    Parameters
+    ----------
+    catalog_path : str or pathlib.Path
+        Input catalog (ECSV or Parquet, chosen by suffix).
+    column : str
+        Column whose absolute value is thresholded.
+    threshold : float
+    output_path : str or pathlib.Path, optional
+        Output catalog; defaults to ``prefix`` + the input file name.  It is written
+        in the same format as the input.
+    prefix : str
+        Prefix for the default output name.
+    min_inclusive : bool
+        If True keep ``abs(column) >= threshold``, otherwise ``>``.
+
+    Returns
+    -------
+    (astropy.table.Table, pathlib.Path)
+        The selected rows and the path they were written to.
+    """
+    catalog_path = Path(catalog_path)
+    catalog = read_catalog(catalog_path, cache=False)
+    if column not in catalog.colnames:
+        raise ValueError(f"Catalog {catalog_path} is missing column {column!r}")
+    values = np.ma.filled(np.ma.asarray(catalog[column], dtype=float), np.nan)
+    with np.errstate(invalid="ignore"):
+        keep = np.isfinite(values) & (np.abs(values) >= threshold if min_inclusive else np.abs(values) > threshold)
+    selected = catalog[keep]
+    if output_path is None:
+        output_path = catalog_path.with_name(prefix + catalog_path.name)
+    output_path = Path(output_path)
+    suffix = output_path.suffix.lower()
+    if suffix == ".parquet":
+        output_format = "parquet"
+    elif suffix == ".ecsv":
+        output_format = "ecsv"
+    else:
+        raise ValueError(f"Unsupported catalog suffix {suffix!r}; use .ecsv or .parquet")
+    write_catalog(selected, output_path, overwrite=True, output_format=output_format)
+    return selected, output_path
 
 
 def load_wcs_from_fits(path, hdu_id=0):
