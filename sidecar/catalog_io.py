@@ -6,14 +6,6 @@ from pathlib import Path
 
 from astropy.table import Table
 
-PARQUET_SUFFIX = ".parquet"
-OUTPUT_FORMATS = ("ecsv", "parquet", "both")
-
-
-def parquet_path(path):
-    """Path of the Parquet companion of a catalog file."""
-    return Path(path).with_suffix(PARQUET_SUFFIX)
-
 
 def _write_parquet(table, path):
     # Write to a temporary name then rename so readers never see a partial file.
@@ -28,6 +20,7 @@ def _write_parquet(table, path):
 
 def catalog_output_paths(path, output_format="parquet"):
     """Return output paths; `both` uses the ECSV path as its primary path."""
+    OUTPUT_FORMATS = ("ecsv", "parquet", "both")
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
     path = Path(path)
@@ -50,35 +43,24 @@ def write_catalog(table, path, overwrite=True, output_format="parquet"):
         _write_parquet(table, paths[-1])
 
 
-def read_catalog(path, cache=True):
-    """Read a catalog, preferring a Parquet companion at least as new as the ECSV.
+def read_catalog(path):
+    """Read a catalog, either parquet or ECSV
 
     Parameters
     ----------
     path : str or Path
-        The ECSV catalog (or a ``.parquet`` file directly).
-    cache : bool
-        If True and no usable Parquet companion exists, write one after reading
-        the ECSV.  Failure to write (e.g. read-only directory) is ignored.
+        The catalog filename.
+        Filenames endeding in ".parquet" or ".pq" are read as Parquet files.
+        Everything else is read as an ECSV file.
     """
+    PARQUET_SUFFIXES = (".parquet", ".pq")
     path = Path(path)
-    if path.suffix.lower() == PARQUET_SUFFIX:
-        return Table.read(path, format="parquet")
+    if path.suffix.lower() in PARQUET_SUFFIXES:
+        format = "parquet"
+    else:
+        format = "ascii.ecsv"
 
-    pq = parquet_path(path)
-    if pq.exists() and pq.stat().st_mtime >= path.stat().st_mtime:
-        try:
-            return Table.read(pq, format="parquet")
-        except (OSError, ValueError):  # corrupt or unreadable cache; fall back to the ECSV
-            pass
-
-    table = Table.read(path, format="ascii.ecsv")
-    if cache:
-        try:
-            _write_parquet(table, pq)
-        except Exception:  # best-effort cache
-            pass
-    return table
+    return Table.read(path, format=format)
 
 
 def _read_one(args):

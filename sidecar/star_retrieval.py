@@ -3,15 +3,14 @@ from pathlib import Path
 
 import astropy.units as u
 from astropy.table import Table
-from astroquery.gaia import Gaia
+# Move the astroquery.gaia import to only the function that needs it,
+# so we don't need astroquery or network access unless we actually want to retrieve from the Gaia archive
+# from astroquery.gaia import Gaia
 
 from sidecar.catalog_io import read_catalog
 
-GAIA_SOURCE_TABLE = "gaiadr3.gaia_source"
-STAR_COLUMNS = ("ra", "dec", "phot_g_mean_mag")
 
-
-def read_star_catalog(path):
+def read_star_catalog(path, star_columns=("ra", "dec", "phot_g_mean_mag")):
     """Read a previously saved star catalog, so no network access is needed.
 
     Parameters
@@ -26,16 +25,13 @@ def read_star_catalog(path):
     astropy.table.Table
     """
     path = Path(path)
-    if path.suffix.lower() != ".parquet" and not path.read_text().strip():
-        return Table(names=STAR_COLUMNS, dtype=(float,) * len(STAR_COLUMNS))
+    if path.suffix.lower() not in [".parquet", ".pq"] and not path.read_text().strip():
+        return Table(names=star_columns, dtype=(float,) * len(star_columns))
 
-    if path.suffix.lower() == ".parquet":
-        stars = read_catalog(path, cache=False)
+    if path.suffix.lower() in [".parquet", ".pq"]:
+        stars = read_catalog(path)
     else:
-        try:
-            stars = read_catalog(path, cache=False)
-        except ValueError:
-            stars = Table.read(path, format="ascii")
+        stars = Table.read(path, format="ascii.ecsv")
 
     if len(stars) > 0:
         missing = {"ra", "dec"} - set(stars.colnames)
@@ -45,7 +41,8 @@ def read_star_catalog(path):
     return stars
 
 
-def retrieve_gaia_stars(ra, dec, radius, max_mag=None):
+
+def retrieve_gaia_stars(ra, dec, radius, max_mag=None, gaia_source_table="gaiadr3.gaia_source"):
     """Retrieve Gaia DR3 sources in a cone.
 
     Parameters
@@ -62,9 +59,11 @@ def retrieve_gaia_stars(ra, dec, radius, max_mag=None):
         Columns: source_id, ra, dec, pmra, pmdec, phot_g_mean_mag.
         Positions are ICRS at the Gaia DR3 reference epoch (2016.0).
     """
+    from astroquery.gaia import Gaia
+
     query = (
         "SELECT source_id, ra, dec, pmra, pmdec, phot_g_mean_mag "
-        f"FROM {GAIA_SOURCE_TABLE} "
+        f"FROM {gaia_source_table} "
         f"WHERE 1=CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {float(ra)}, {float(dec)}, "
         f"{radius.to_value(u.deg)}))"
     )
@@ -107,14 +106,14 @@ def main():
 
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument("image_path", type=str, help="ASDF image to cover.")
-    parser.add_argument("-o", "--output", type=str, default=None, help="Output ECSV.  Default: <image stem>_gaia.ecsv")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output catalog.  Default: <image stem>_gaia.parquet")
     parser.add_argument("--max-mag", type=float, default=None, help="Only include stars with G brighter than this.")
     args = parser.parse_args()
 
-    output = args.output or Path(args.image_path).with_suffix("").name + "_gaia.ecsv"
+    output = args.output or Path(args.image_path).with_suffix("").name + "_gaia.parquet"
     image = RomanDatamodelImage(args.image_path, no_base_path=True)
     stars = retrieve_gaia_stars_for_image(image, max_mag=args.max_mag)
-    stars.write(output, format="ascii.ecsv", overwrite=True)
+    stars.write(output, format="parquet", overwrite=True)
     print(f"Wrote {len(stars)} stars to {output}")
 
 
