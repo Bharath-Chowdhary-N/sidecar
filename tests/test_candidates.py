@@ -54,7 +54,7 @@ def test_statistics(nested):
     stats = add_object_statistics(nested, noise=0.2)
     row = stats.loc[stats["ra"].sub(10.0).abs().idxmin()]
     assert row["n_band"] == 5
-    assert row["z_med"] == pytest.approx(10.0)
+    assert row["snr_med"] == pytest.approx(10.0)
     assert row["sign_consistency"] == 1 and row["sign_agreement"] == 1
     assert row["bright_flux"] == pytest.approx(3.0)
     assert row["frac_change"] == pytest.approx(2.5 / 3.0)
