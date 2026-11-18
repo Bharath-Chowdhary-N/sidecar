@@ -213,7 +213,9 @@ def write_candidates(candidates, path, region_file=None):
             f.write("# Candidates from sidecar.candidates\nfk5\n")
             for _, row in candidates.sort_values("snr_med", key=abs, ascending=False).iterrows():
                 color = "green" if row["snr_med"] > 0 else "red"
-                f.write(f'circle({row["ra"]:.7f},{row["dec"]:.7f},1") # color={color} text={{z={row["snr_med"]:.1f}}}\n')
+                f.write(
+                    f'circle({row["ra"]:.7f},{row["dec"]:.7f},1") # color={color} text={{z={row["snr_med"]:.1f}}}\n'
+                )
     return table
 
 

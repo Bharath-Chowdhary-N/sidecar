@@ -748,9 +748,10 @@ class Detection:
                     single_pixel_product="diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
                 )
-            except FileNotFoundError as e:
+            except FileNotFoundError:
                 SNLogger.warning(
-                    f"Skipping star rejection for diffim detection; catalog not found: {file_path['difference_detection_path']}"
+                    f"Skipping star rejection for diffim detection; "
+                    f"catalog not found: {file_path['difference_detection_path']}"
                 )
 
             SNLogger.info("Removing known stars from score image detection")
@@ -768,9 +769,10 @@ class Detection:
                     single_pixel_product="score" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
                 )
-            except FileNotFoundError as e:
+            except FileNotFoundError:
                 SNLogger.warning(
-                    f"Skipping star rejection for score image detection; catalog not found: {file_path['score_detection_path']}"
+                    f"Skipping star rejection for score image detection; "
+                    f"catalog not found: {file_path['score_detection_path']}"
                 )
 
         if self.save_candidates_to_database:
