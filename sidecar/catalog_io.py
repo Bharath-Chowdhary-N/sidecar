@@ -29,7 +29,7 @@ def write_catalog(table, path, overwrite=True, output_format="parquet"):
     if not overwrite:
         if path.exists():
             raise FileExistsError(f"Catalog already exists: {path}")
-    table.write(path, overwrite=overwrite, format=output_format)
+    table.write(path, overwrite=overwrite, format="ascii.ecsv" if output_format == "ecsv" else output_format)
 
 
 def read_catalog(path):
