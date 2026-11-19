@@ -11,7 +11,7 @@ from sidecar.catalog_io import read_catalog
 
 
 def read_star_catalog(path, star_columns=("ra", "dec", "phot_g_mean_mag")):
-    """Read a previously saved star catalog, so no network access is needed.
+    """Read a previously saved star catalog
 
     Parameters
     ----------
@@ -30,8 +30,10 @@ def read_star_catalog(path, star_columns=("ra", "dec", "phot_g_mean_mag")):
 
     if path.suffix.lower() in [".parquet", ".pq"]:
         stars = read_catalog(path)
-    else:
+    elif path.suffix.lower() in [".ecsv"]:
         stars = Table.read(path, format="ascii.ecsv")
+    else:
+        stars = Table.read(path, format="ascii")
 
     if len(stars) > 0:
         missing = {"ra", "dec"} - set(stars.colnames)

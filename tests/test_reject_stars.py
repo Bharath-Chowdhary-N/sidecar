@@ -9,7 +9,7 @@ from roman_datamodels import dqflags
 
 from sidecar import pipeline
 from sidecar import reject_stars as reject_stars_cli
-from sidecar.catalog_io import read_catalog
+from sidecar.catalog_io import read_catalog, write_catalog
 from sidecar.pipeline import Detection
 from sidecar.star_retrieval import read_star_catalog
 from sidecar.util import reject_stars, star_rejection_radii
@@ -63,48 +63,38 @@ def test_empty():
 
 @pytest.mark.parametrize("detection_format", ["ecsv", "parquet"])
 @pytest.mark.parametrize("star_format", ["ecsv", "parquet"])
-@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
 def test_reject_stars_cli_catalog_formats(tmp_path, monkeypatch, detection_format, star_format, output_format):
     detection, stars = _tables()
     detection_path = tmp_path / f"detections.{detection_format}"
     star_path = tmp_path / f"stars.{star_format}"
-    detection.write(detection_path, format="ascii.ecsv" if detection_format == "ecsv" else "parquet")
-    stars.write(star_path, format="ascii.ecsv" if star_format == "ecsv" else "parquet")
+    write_catalog(detection, detection_path, output_format=detection_format)
+    write_catalog(stars, star_path, output_format=star_format)
     monkeypatch.setattr(sys, "argv", [
         "reject_stars", str(detection_path), str(star_path), "--catalog-output-format", output_format
     ])
     reject_stars_cli.main()
     ecsv = tmp_path / "cleaned_detections.ecsv"
     parquet = tmp_path / "cleaned_detections.parquet"
-    assert ecsv.exists() == (output_format in ("ecsv", "both"))
-    assert parquet.exists() == (output_format in ("parquet", "both"))
+    assert ecsv.exists() == (output_format in ("ecsv", ))
+    assert parquet.exists() == (output_format in ("parquet", ))
     output = parquet if output_format == "parquet" else ecsv
     assert list(read_catalog(output)["id"]) == [0, 1, 3, 5]
-
-
-def test_reject_stars_cli_rejects_conflicting_output_path(tmp_path, monkeypatch, capsys):
-    output = tmp_path / "cleaned.ecsv"
-    monkeypatch.setattr(sys, "argv", ["reject_stars", "input.ecsv", "stars.ecsv", "-o", str(output)])
-    with pytest.raises(SystemExit) as exc:
-        reject_stars_cli.main()
-    assert exc.value.code == 2
-    assert "must end in .parquet" in capsys.readouterr().err
-    assert not output.exists()
 
 
 def test_reject_stars_cli_default_parquet(tmp_path, monkeypatch):
     detection, stars = _tables()
     detection_path = tmp_path / "detections.ecsv"
     star_path = tmp_path / "stars.ecsv"
-    detection.write(detection_path, format="ascii.ecsv")
-    stars.write(star_path, format="ascii.ecsv")
+    write_catalog(detection, detection_path, output_format="ecsv")
+    write_catalog(stars, star_path, output_format="ecsv")
     monkeypatch.setattr(sys, "argv", ["reject_stars", str(detection_path), str(star_path)])
     reject_stars_cli.main()
     assert list(read_catalog(tmp_path / "cleaned_detections.parquet")["id"]) == [0, 1, 3, 5]
     assert not (tmp_path / "cleaned_detections.ecsv").exists()
 
 
-def test_read_star_catalog_parquet_and_text_compatibility(tmp_path):
+def test_read_star_catalog_text_compatibility(tmp_path):
     empty = tmp_path / "empty.txt"
     empty.write_text("  \n")
     assert len(read_star_catalog(empty)) == 0
@@ -113,17 +103,19 @@ def test_read_star_catalog_parquet_and_text_compatibility(tmp_path):
     text.write_text("ra dec phot_g_mean_mag\n10.0 0.0 18.0\n")
     assert len(read_star_catalog(text)) == 1
 
+
+def test_read_star_catalog_parquet(tmp_path):
     parquet = tmp_path / "stars.PARQUET"
-    Table({"ra": [10.0], "dec": [0.0], "phot_g_mean_mag": [18.0]}).write(parquet, format="parquet")
+    write_catalog(Table({"ra": [10.0], "dec": [0.0], "phot_g_mean_mag": [18.0]}), parquet)
     assert list(read_star_catalog(parquet)["ra"]) == [10.0]
     assert list(read_catalog(parquet)["ra"]) == [10.0]
 
     empty_parquet = tmp_path / "empty.parquet"
-    Table(names=["ra", "dec"], dtype=[float, float]).write(empty_parquet, format="parquet")
+    write_catalog(Table(names=["ra", "dec"], dtype=[float, float]), empty_parquet)
     assert len(read_star_catalog(empty_parquet)) == 0
 
     missing = tmp_path / "missing.parquet"
-    Table({"ra": [10.0]}).write(missing, format="parquet")
+    write_catalog(Table({"ra": [10.0]}), missing)
     with pytest.raises(ValueError, match="missing required columns.*dec"):
         read_star_catalog(missing)
     corrupt = tmp_path / "corrupt.parquet"
@@ -132,7 +124,8 @@ def test_read_star_catalog_parquet_and_text_compatibility(tmp_path):
         read_star_catalog(corrupt)
 
 
-def test_clean_score_bad_pixels_and_absolute_snr(tmp_path):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_clean_score_bad_pixels_and_absolute_snr(tmp_path, output_format):
     detections = Table(
         {
             "id": np.arange(8),
@@ -146,8 +139,8 @@ def test_clean_score_bad_pixels_and_absolute_snr(tmp_path):
     )
     stars = Table({"ra": [80.0], "dec": [0.0]})
     path = tmp_path / "score.ecsv"
-    out = tmp_path / "cleaned.ecsv"
-    detections.write(path)
+    out = tmp_path / f"cleaned.{output_format}"
+    write_catalog(detections, path, output_format="ecsv")
     cleaned = Detection.reject_stars(
         stars,
         path,
@@ -156,9 +149,10 @@ def test_clean_score_bad_pixels_and_absolute_snr(tmp_path):
         bad_pixel_column="score_flags_npix_bad",
         snr_column="score_aper_r3_snr",
         min_abs_snr=7.0,
+        output_format=output_format,
     )
     assert list(cleaned["id"]) == [0, 1]
-    assert list(Table.read(out)["id"]) == [0, 1]
+    assert list(read_catalog(out)["id"]) == [0, 1]
     adjusted = Detection.reject_stars(
         stars,
         path,
@@ -167,11 +161,13 @@ def test_clean_score_bad_pixels_and_absolute_snr(tmp_path):
         bad_pixel_column="score_flags_npix_bad",
         snr_column="score_aper_r3_snr",
         min_abs_snr=6.0,
+        output_format=output_format,
     )
     assert list(adjusted["id"]) == [0, 1, 2]
 
 
-def test_clean_simple_bad_pixels_without_snr_cut(tmp_path):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_clean_simple_bad_pixels_without_snr_cut(tmp_path, output_format):
     detections = Table(
         {
             "id": [1, 2, 3],
@@ -182,18 +178,23 @@ def test_clean_simple_bad_pixels_without_snr_cut(tmp_path):
         }
     )
     path = tmp_path / "simple.ecsv"
-    detections.write(path)
+    write_catalog(detections, path, output_format="ecsv")
     stars = Table({"ra": [], "dec": []})
     cleaned = Detection.reject_stars(
-        stars, path, 5.0, tmp_path / "cleaned.ecsv", bad_pixel_column="simple_diff_flags_npix_bad"
+        stars, path, 5.0, tmp_path / f"cleaned.{output_format}",
+        bad_pixel_column="simple_diff_flags_npix_bad", output_format=output_format,
     )
     assert list(cleaned["id"]) == [1]
     with pytest.raises(ValueError, match="provided together"):
-        Detection.reject_stars(stars, path, 5.0, tmp_path / "invalid.ecsv", snr_column="simple_diff_aper_r3_snr")
+        Detection.reject_stars(
+            stars, path, 5.0, tmp_path / f"invalid.{output_format}",
+            snr_column="simple_diff_aper_r3_snr", output_format=output_format,
+        )
 
 
 @pytest.mark.parametrize("column_collection", [list, np.array])
-def test_clean_rejects_bad_or_unmeasured_pixels_in_any_image(tmp_path, column_collection):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_clean_rejects_bad_or_unmeasured_pixels_in_any_image(tmp_path, column_collection, output_format):
     detections = Table(
         {
             "id": np.arange(6),
@@ -208,19 +209,22 @@ def test_clean_rejects_bad_or_unmeasured_pixels_in_any_image(tmp_path, column_co
         detections["science_flags_npix_bad"], mask=[False, False, False, False, False, True]
     )
     path = tmp_path / "detections.ecsv"
-    out = tmp_path / "cleaned.ecsv"
-    detections.write(path)
+    out = tmp_path / f"cleaned.{output_format}"
+    write_catalog(detections, path, output_format="ecsv")
     stars = Table({"ra": [], "dec": []})
     columns = column_collection(["template_flags_npix_bad", "science_flags_npix_bad", "score_flags_npix_bad"])
-    cleaned = Detection.reject_stars(stars, path, 5.0, out, bad_pixel_column=columns)
+    cleaned = Detection.reject_stars(stars, path, 5.0, out, bad_pixel_column=columns, output_format=output_format)
     assert list(cleaned["id"]) == [0]
-    assert list(Table.read(out)["id"]) == [0]
+    assert list(read_catalog(out)["id"]) == [0]
     with pytest.raises(KeyError):
-        Detection.reject_stars(stars, path, 5.0, out, bad_pixel_column=["template_flags_npix_bad", "missing"])
+        Detection.reject_stars(
+            stars, path, 5.0, out, bad_pixel_column=["template_flags_npix_bad", "missing"], output_format=output_format
+        )
 
 
 @pytest.mark.parametrize("product", ["score", "simple_diff"])
-def test_center_flag_rejection(tmp_path, product):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_center_flag_rejection(tmp_path, product, output_format):
     jump = int(dqflags.pixel.JUMP_DET)
     other = int(dqflags.pixel.PERSISTENCE)
     detections = Table(
@@ -237,20 +241,25 @@ def test_center_flag_rejection(tmp_path, product):
         detections["science_flags_center"], mask=[False, False, False, False, False, True, False, False]
     )
     path = tmp_path / "detections.ecsv"
-    out = tmp_path / "cleaned.ecsv"
-    detections.write(path)
+    out = tmp_path / f"cleaned.{output_format}"
+    write_catalog(detections, path, output_format="ecsv")
     stars = Table({"ra": [], "dec": []})
     columns = ["template_flags_center", "science_flags_center", f"{product}_flags_center"]
-    cleaned = Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns, center_dq_flags=jump)
+    cleaned = Detection.reject_stars(
+        stars, path, 5, out, center_flag_columns=columns, center_dq_flags=jump, output_format=output_format
+    )
     assert list(cleaned["id"]) == [0, 6, 7]
-    assert list(Table.read(out)["id"]) == [0, 6, 7]
-    cleaned = Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns, center_dq_flags=jump | other)
+    assert list(read_catalog(out)["id"]) == [0, 6, 7]
+    cleaned = Detection.reject_stars(
+        stars, path, 5, out, center_flag_columns=columns, center_dq_flags=jump | other, output_format=output_format
+    )
     assert list(cleaned["id"]) == [0, 7]
     cleaned = Detection.reject_stars(
-        stars, path, 5, out, center_flag_columns="template_flags_center", center_dq_flags=jump
+        stars, path, 5, out, center_flag_columns="template_flags_center", center_dq_flags=jump,
+        output_format=output_format,
     )
     assert list(cleaned["id"]) == [0, 2, 3, 5, 6, 7]
-    assert len(Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns)) == 8
+    assert len(Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns, output_format=output_format)) == 8
     with pytest.raises(ValueError, match="center_flag_columns"):
         Detection.reject_stars(stars, path, 5, out, center_dq_flags=jump)
     with pytest.raises(ValueError, match="center_flag_columns"):
@@ -260,7 +269,8 @@ def test_center_flag_rejection(tmp_path, product):
 
 
 @pytest.mark.parametrize("product", ["simple_diff", "diff", "score"])
-def test_single_pixel_rejection_keeps_inconclusive_and_point_source(tmp_path, product, monkeypatch):
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_single_pixel_rejection_keeps_inconclusive_and_point_source(tmp_path, product, monkeypatch, output_format):
     n = 10
     table = Table(
         {
@@ -287,14 +297,14 @@ def test_single_pixel_rejection_keeps_inconclusive_and_point_source(tmp_path, pr
     table["science_aper_r5_npix_valid"][7] -= 0.2
     table["science_aper_r3_flux"][9] = 0
     path = tmp_path / "input.ecsv"
-    out = tmp_path / "cleaned.ecsv"
-    table.write(path)
+    out = tmp_path / f"cleaned.{output_format}"
+    write_catalog(table, path, output_format="ecsv")
     stars = Table({"ra": [], "dec": []})
     warnings = []
     monkeypatch.setattr(pipeline.SNLogger, "warning", warnings.append)
-    cleaned = Detection.reject_stars(stars, path, 5, out, single_pixel_product=product)
+    cleaned = Detection.reject_stars(stars, path, 5, out, single_pixel_product=product, output_format=output_format)
     assert list(cleaned["id"]) == [2, 3, 4, 5, 6, 7, 9]
-    assert list(Table.read(out)["id"]) == [2, 3, 4, 5, 6, 7, 9]
+    assert list(read_catalog(out)["id"]) == [2, 3, 4, 5, 6, 7, 9]
     assert any("6 candidates with inconclusive" in warning for warning in warnings)
     relaxed = Detection.reject_stars(
         stars,
@@ -303,9 +313,10 @@ def test_single_pixel_rejection_keeps_inconclusive_and_point_source(tmp_path, pr
         out,
         single_pixel_product=product,
         single_pixel_options={"min_r2_r3": 0.96},
+        output_format=output_format,
     )
     assert len(relaxed) == n
-    assert len(Detection.reject_stars(stars, path, 5, out)) == n
+    assert len(Detection.reject_stars(stars, path, 5, out, output_format=output_format)) == n
     with pytest.raises(ValueError, match="min_peak_r3"):
         Detection.reject_stars(
             stars, path, 5, out, single_pixel_product=product, single_pixel_options={"min_peak_r3": np.nan}
@@ -404,7 +415,7 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
         assert detection.output_format == "parquet"
 
 
-@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
 def test_pipeline_output_paths_follow_format(monkeypatch, tmp_path, output_format):
     class TestConfig:
         def value(self, key, default=None):
@@ -424,7 +435,7 @@ def test_pipeline_output_paths_follow_format(monkeypatch, tmp_path, output_forma
     assert paths["difference_image_path"].suffix == ".fits"
 
 
-@pytest.mark.parametrize("output_format", ["ecsv", "parquet", "both"])
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
 def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, output_format):
     class TestConfig:
         def value(self, key, default=None):

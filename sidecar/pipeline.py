@@ -226,7 +226,7 @@ class Detection:
         science_truth_path,
         template_truth_path,
         difference_truth_path,
-        output_format="both",
+        output_format="parquet",
     ):
         science_wcs = science_image.get_wcs()
         template_wcs = template_image.get_wcs()
@@ -251,7 +251,7 @@ class Detection:
         x_col="X_IMAGE",
         y_col="Y_IMAGE",
         id_col="id",
-        output_format="both",
+        output_format="parquet",
     ):
         """Match a truth catalog to subtraction detection catalogs
 
@@ -297,7 +297,7 @@ class Detection:
         return transients_to_detection, detection_to_transients
 
     @staticmethod
-    def retrieve_stars(science_image, star_catalog_path, max_mag=None, output_format="both"):
+    def retrieve_stars(science_image, star_catalog_path, max_mag=None, output_format="parquet"):
         """Retrieve Gaia DR3 stars covering the science image and save them to star_catalog_path."""
         stars = star_retrieval.retrieve_gaia_stars_for_image(science_image, max_mag=max_mag)
         write_catalog(stars, star_catalog_path, overwrite=True, output_format=output_format)
@@ -319,7 +319,7 @@ class Detection:
         center_dq_flags=0,
         single_pixel_product=None,
         single_pixel_options=None,
-        output_format="both",
+        output_format="parquet",
         **radius_kwargs,
     ):
         """Reject stars from subtraction detection catalogs

@@ -7,7 +7,9 @@ from pathlib import Path
 from astropy.table import Table
 
 # Global to be referenced by other parts to get a consistent list of output formats.
-OUTPUT_FORMATS = ("ecsv", "parquet", "both")
+# and parquet suffixes
+SUFFIXES = {"ecsv": (".ecsv"), "parquet": (".parquet", ".pq")}
+OUTPUT_FORMATS = tuple(SUFFIXES.keys())
 
 def _write_parquet(table, path):
     # Write to a temporary name then rename so readers never see a partial file.
@@ -20,28 +22,12 @@ def _write_parquet(table, path):
             tmp.unlink()
 
 
-def catalog_output_paths(path, output_format="parquet"):
-    """Return output paths; `both` uses the ECSV path as its primary path."""
-    if output_format not in OUTPUT_FORMATS:
-        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
-    path = Path(path)
-    expected = ".parquet" if output_format == "parquet" else ".ecsv"
-    if path.suffix.lower() != expected:
-        raise ValueError(f"output path {path} must end in {expected} for output format {output_format}")
-    return (path, parquet_path(path)) if output_format == "both" else (path,)
-
-
 def write_catalog(table, path, overwrite=True, output_format="parquet"):
-    """Write a Parquet, ECSV, or both-format catalog at the specified path."""
-    paths = catalog_output_paths(path, output_format)
+    """Write a Parquet or ECSV format catalog at the specified path."""
     if not overwrite:
-        for target in paths:
-            if target.exists():
-                raise FileExistsError(f"Catalog already exists: {target}")
-    if output_format in ("ecsv", "both"):
-        table.write(paths[0], overwrite=overwrite, format="ascii.ecsv")
-    if output_format in ("parquet", "both"):
-        _write_parquet(table, paths[-1])
+        if path.exists():
+            raise FileExistsError(f"Catalog already exists: {path}")
+    table.write(path, overwrite=overwrite, format=output_format)
 
 
 def read_catalog(path):
@@ -54,9 +40,8 @@ def read_catalog(path):
         Filenames endeding in ".parquet" or ".pq" are read as Parquet files.
         Everything else is read as an ECSV file.
     """
-    PARQUET_SUFFIXES = (".parquet", ".pq")
     path = Path(path)
-    if path.suffix.lower() in PARQUET_SUFFIXES:
+    if path.suffix.lower() in SUFFIXES["parquet"]:
         format = "parquet"
     else:
         format = "ascii.ecsv"

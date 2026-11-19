@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from sidecar.catalog_io import OUTPUT_FORMATS, catalog_output_paths, read_catalog, write_catalog
+from sidecar.catalog_io import OUTPUT_FORMATS, read_catalog, write_catalog
 from sidecar.star_retrieval import read_star_catalog
 from sidecar.util import DEFAULT_STAR_MAG_COL, reject_stars
 from snappl.logger import SNLogger
@@ -20,7 +20,7 @@ def main():
         help="Output catalog path. Default: cleaned_<catalog stem> with the appropriate extension.",
     )
     parser.add_argument("--catalog-output-format", choices=OUTPUT_FORMATS, default="parquet",
-                        help="Output format (default: %(default)s); both uses an ECSV output path.")
+                        help="Output format (default: %(default)s)")
     parser.add_argument("--match-radius", type=float, default=5.0, help="Base rejection radius in arcsec")
     parser.add_argument("--ref-mag", type=float, default=None, help="Stars brighter than this get a larger radius")
     parser.add_argument("--scale", type=float, default=0.2, help="Radius grows as 10**(scale * (ref_mag - mag))")
@@ -36,10 +36,6 @@ def main():
     catalog_path = Path(args.catalog)
     suffix = ".parquet" if args.catalog_output_format == "parquet" else ".ecsv"
     output = Path(args.output) if args.output else catalog_path.with_name("cleaned_" + catalog_path.stem + suffix)
-    try:
-        output_paths = catalog_output_paths(output, args.catalog_output_format)
-    except ValueError as exc:
-        parser.error(str(exc))
 
     detection = read_catalog(catalog_path)
     stars = read_star_catalog(args.star_catalog)
@@ -58,7 +54,7 @@ def main():
         max_radius=args.max_radius,
     )
     write_catalog(cleaned, output, overwrite=True, output_format=args.catalog_output_format)
-    SNLogger.info(f"Kept {len(cleaned)} of {len(detection)} sources; wrote {', '.join(map(str, output_paths))}")
+    SNLogger.info(f"Kept {len(cleaned)} of {len(detection)} sources; wrote {output}")
 
 
 if __name__ == "__main__":
