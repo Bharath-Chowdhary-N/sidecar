@@ -41,7 +41,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    detection = read_catalog(catalog_path, cache=False)
+    detection = read_catalog(catalog_path)
     stars = read_star_catalog(args.star_catalog)
     cleaned = reject_stars(
         detection,

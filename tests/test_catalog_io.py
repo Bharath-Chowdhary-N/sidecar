@@ -32,26 +32,10 @@ def test_read_catalog_prefers_parquet_and_round_trips(tmp_path):
     assert got.meta["detector"] == 7
 
 
-def test_read_catalog_creates_and_refreshes_cache(tmp_path):
+def test_read_catalog(tmp_path):
     path = tmp_path / "cat.ecsv"
     _table().write(path, format="ascii.ecsv")
-    assert not parquet_path(path).exists()
     read_catalog(path)
-    assert parquet_path(path).exists()
-
-    # An ECSV newer than its parquet copy must win.
-    new = _table()
-    new["n"] = [10, 20]
-    new.write(path, format="ascii.ecsv", overwrite=True)
-    stat = parquet_path(path).stat()
-    os.utime(path, (stat.st_atime, stat.st_mtime + 10))
-    assert list(read_catalog(path)["n"]) == [10, 20]
-
-
-def test_read_catalog_no_cache(tmp_path):
-    path = tmp_path / "cat.ecsv"
-    _table().write(path, format="ascii.ecsv")
-    read_catalog(path, cache=False)
     assert not parquet_path(path).exists()
 
 
@@ -74,7 +58,7 @@ def test_write_catalog_formats_and_overwrite(tmp_path, output_format):
     write_catalog(_table(), path, output_format=output_format)
     assert (tmp_path / "cat.ecsv").exists() == (output_format in ("ecsv", "both"))
     assert (tmp_path / "cat.parquet").exists() == (output_format in ("parquet", "both"))
-    assert list(read_catalog(path, cache=False)["n"]) == [1, 2]
+    assert list(read_catalog(path)["n"]) == [1, 2]
     with pytest.raises(FileExistsError):
         write_catalog(_table(), path, overwrite=False, output_format=output_format)
 

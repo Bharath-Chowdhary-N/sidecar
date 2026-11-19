@@ -55,7 +55,7 @@ def save_dia_objects_from_subtraction(
         Significance of detection.  Cut will be abs(threshold_column) > threshold
     threshold_column: str, name of column to filter
     """
-    dia_sources = read_catalog(dia_source_catalog_path, cache=False)
+    dia_sources = read_catalog(dia_source_catalog_path)
     science = image_collection.get_image(observation_id=science_observation_id, sca=science_sca, band=science_band)
 
     if threshold is not None:

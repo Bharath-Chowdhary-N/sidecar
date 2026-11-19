@@ -64,18 +64,13 @@ def read_catalog(path):
     return Table.read(path, format=format)
 
 
-def _read_one(args):
-    path, cache = args
-    return read_catalog(path, cache=cache)
-
-
-def read_catalogs(paths, n_jobs=1, cache=True):
+def read_catalogs(paths, n_jobs=1):
     """Read many catalogs, in parallel across processes if `n_jobs` > 1 (0 or None: all CPUs)."""
     paths = list(paths)
     if n_jobs is None or n_jobs <= 0:
         n_jobs = os.cpu_count() or 1
     n_jobs = min(n_jobs, len(paths))
     if n_jobs <= 1:
-        return [read_catalog(p, cache=cache) for p in paths]
+        return [read_catalog(p) for p in paths]
     with ProcessPoolExecutor(max_workers=n_jobs) as pool:
-        return list(pool.map(_read_one, [(p, cache) for p in paths], chunksize=4))
+        return list(pool.map(read_catalog, [p for p in paths], chunksize=4))

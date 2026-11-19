@@ -427,19 +427,17 @@ def match_catalog_files(
     min_distinct_positions=2,
     overwrite=True,
     n_jobs=1,
-    cache=True,
     nested_output_path=None,
 ):
     """Read .ecsv catalogs, match them with `match_catalogs`, and write the result.
 
-    Catalogs are read in parallel over `n_jobs` processes (0: all CPUs).  With `cache`, a
-    ``.parquet`` copy is written beside each ECSV and used on later runs while up to date.
+    Catalogs are read in parallel over `n_jobs` processes (0: all CPUs).
 
     If `nested_output_path` is given, also write the nested object/source catalog of
     `match_catalogs_nested` to that Parquet file.
     """
     input_paths = list(input_paths)
-    tables = read_catalogs(input_paths, n_jobs=n_jobs, cache=cache)
+    tables = read_catalogs(input_paths, n_jobs=n_jobs)
     for p, table in zip(input_paths, tables):
         table.meta.update(parse_catalog_path(p))
         detector = _detector_from_path(p)
@@ -527,12 +525,6 @@ examples:
         help="Number of processes for reading catalogs (default 0: all CPUs).",
     )
     parser.add_argument(
-        "--cache",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Create (if don't exist) and read Parquet copies of the ecsv catalogs.",
-    )
-    parser.add_argument(
         "--nested-output",
         default=None,
         metavar="PARQUET",
@@ -550,7 +542,6 @@ examples:
         min_pixel_separation=args.min_pixel_separation,
         min_distinct_positions=args.min_distinct_positions,
         n_jobs=args.jobs,
-        cache=args.cache,
         nested_output_path=args.nested_output,
     )
     SNLogger.info(f"Wrote {len(matched)} objects to {args.output}")

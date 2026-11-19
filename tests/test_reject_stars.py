@@ -79,7 +79,7 @@ def test_reject_stars_cli_catalog_formats(tmp_path, monkeypatch, detection_forma
     assert ecsv.exists() == (output_format in ("ecsv", "both"))
     assert parquet.exists() == (output_format in ("parquet", "both"))
     output = parquet if output_format == "parquet" else ecsv
-    assert list(read_catalog(output, cache=False)["id"]) == [0, 1, 3, 5]
+    assert list(read_catalog(output)["id"]) == [0, 1, 3, 5]
 
 
 def test_reject_stars_cli_rejects_conflicting_output_path(tmp_path, monkeypatch, capsys):
@@ -516,9 +516,9 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
         1,
         assume_subtraction_has_been_run=True,
     )
-    assert list(read_catalog(paths["cleaned_score_detection_path"], cache=False)["id"]) == [0]
-    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"], cache=False)["id"]) == [0]
-    assert list(read_catalog(paths["cleaned_difference_detection_path"], cache=False)["id"]) == [0, 1]
+    assert list(read_catalog(paths["cleaned_score_detection_path"])["id"]) == [0]
+    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"])["id"]) == [0]
+    assert list(read_catalog(paths["cleaned_difference_detection_path"])["id"]) == [0, 1]
     instance.reject_single_pixel = False
     instance.run_one_subtraction(
         SimpleNamespace(get_image=lambda path: object()),
@@ -530,5 +530,5 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
         1,
         assume_subtraction_has_been_run=True,
     )
-    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"], cache=False)["id"]) == [0, 2]
-    assert list(read_catalog(paths["cleaned_difference_detection_path"], cache=False)["id"]) == [0, 1, 2]
+    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"])["id"]) == [0, 2]
+    assert list(read_catalog(paths["cleaned_difference_detection_path"])["id"]) == [0, 1, 2]

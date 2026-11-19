@@ -281,7 +281,7 @@ class Detection:
         """
         difference_wcs = load_wcs_from_fits(difference_image_path, hdu_id=0)
 
-        detection = read_catalog(difference_detection_path, cache=False)
+        detection = read_catalog(difference_detection_path)
         transients = truth[truth["object_type"] == "transient"]
         transients_skycoord = SkyCoord(transients["object_ra"], transients["object_dec"], frame=frame, unit="deg")
         detection_skycoord = pixel_to_skycoord(detection[x_col], detection[y_col], difference_wcs)
@@ -368,7 +368,7 @@ class Detection:
             raise ValueError("center_flag_columns must be provided when center_dq_flags is nonzero")
         if center_dq_flags and not isinstance(center_flag_columns, str) and len(center_flag_columns) == 0:
             raise ValueError("center_flag_columns must not be empty when center_dq_flags is nonzero")
-        detection = read_catalog(difference_detection_path, cache=False)
+        detection = read_catalog(difference_detection_path)
         cleaned_detection = util.reject_stars(
             detection, stars, match_radius, frame=frame, ra_col=ra_col, dec_col=dec_col, **radius_kwargs
         )

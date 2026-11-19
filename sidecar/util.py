@@ -581,7 +581,7 @@ def write_ds9_regions_from_catalog(
     or if peak_value_threshold is None,
     then all sources are written to the DS9 region file.
     """
-    catalog = read_catalog(catalog_path, cache=False)
+    catalog = read_catalog(catalog_path)
 
     # Normalize the CLI-style "none" string once so the rest only checks for None.
     # if peak_value_column is already None, then this preserves that (by doing nothing).
@@ -644,7 +644,7 @@ def filter_catalog_by_abs_threshold(
         The selected rows and the path they were written to.
     """
     catalog_path = Path(catalog_path)
-    catalog = read_catalog(catalog_path, cache=False)
+    catalog = read_catalog(catalog_path)
     if column not in catalog.colnames:
         raise ValueError(f"Catalog {catalog_path} is missing column {column!r}")
     values = np.ma.filled(np.ma.asarray(catalog[column], dtype=float), np.nan)
