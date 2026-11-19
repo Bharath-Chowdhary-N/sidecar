@@ -43,6 +43,9 @@ def main():
     catalog_path = Path(args.catalog)
     suffix = ".parquet" if args.catalog_output_format == "parquet" else ".ecsv"
     output = Path(args.output) if args.output else catalog_path.with_name("cleaned_" + catalog_path.stem + suffix)
+    allowed_suffixes = (".parquet", ".pq") if args.catalog_output_format == "parquet" else (".ecsv",)
+    if output.suffix.lower() not in allowed_suffixes:
+        parser.error("--output extension must match --catalog-output-format")
 
     detection = read_catalog(catalog_path)
     stars = read_star_catalog(args.star_catalog)
