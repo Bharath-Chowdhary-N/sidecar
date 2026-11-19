@@ -70,14 +70,14 @@ def test_reject_stars_cli_catalog_formats(tmp_path, monkeypatch, detection_forma
     star_path = tmp_path / f"stars.{star_format}"
     write_catalog(detection, detection_path, output_format=detection_format)
     write_catalog(stars, star_path, output_format=star_format)
-    monkeypatch.setattr(sys, "argv", [
-        "reject_stars", str(detection_path), str(star_path), "--catalog-output-format", output_format
-    ])
+    monkeypatch.setattr(
+        sys, "argv", ["reject_stars", str(detection_path), str(star_path), "--catalog-output-format", output_format]
+    )
     reject_stars_cli.main()
     ecsv = tmp_path / "cleaned_detections.ecsv"
     parquet = tmp_path / "cleaned_detections.parquet"
-    assert ecsv.exists() == (output_format in ("ecsv", ))
-    assert parquet.exists() == (output_format in ("parquet", ))
+    assert ecsv.exists() == (output_format in ("ecsv",))
+    assert parquet.exists() == (output_format in ("parquet",))
     output = parquet if output_format == "parquet" else ecsv
     assert list(read_catalog(output)["id"]) == [0, 1, 3, 5]
 
@@ -181,14 +181,22 @@ def test_clean_simple_bad_pixels_without_snr_cut(tmp_path, output_format):
     write_catalog(detections, path, output_format="ecsv")
     stars = Table({"ra": [], "dec": []})
     cleaned = Detection.reject_stars(
-        stars, path, 5.0, tmp_path / f"cleaned.{output_format}",
-        bad_pixel_column="simple_diff_flags_npix_bad", output_format=output_format,
+        stars,
+        path,
+        5.0,
+        tmp_path / f"cleaned.{output_format}",
+        bad_pixel_column="simple_diff_flags_npix_bad",
+        output_format=output_format,
     )
     assert list(cleaned["id"]) == [1]
     with pytest.raises(ValueError, match="provided together"):
         Detection.reject_stars(
-            stars, path, 5.0, tmp_path / f"invalid.{output_format}",
-            snr_column="simple_diff_aper_r3_snr", output_format=output_format,
+            stars,
+            path,
+            5.0,
+            tmp_path / f"invalid.{output_format}",
+            snr_column="simple_diff_aper_r3_snr",
+            output_format=output_format,
         )
 
 
@@ -255,11 +263,18 @@ def test_center_flag_rejection(tmp_path, product, output_format):
     )
     assert list(cleaned["id"]) == [0, 7]
     cleaned = Detection.reject_stars(
-        stars, path, 5, out, center_flag_columns="template_flags_center", center_dq_flags=jump,
+        stars,
+        path,
+        5,
+        out,
+        center_flag_columns="template_flags_center",
+        center_dq_flags=jump,
         output_format=output_format,
     )
     assert list(cleaned["id"]) == [0, 2, 3, 5, 6, 7]
-    assert len(Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns, output_format=output_format)) == 8
+    assert (
+        len(Detection.reject_stars(stars, path, 5, out, center_flag_columns=columns, output_format=output_format)) == 8
+    )
     with pytest.raises(ValueError, match="center_flag_columns"):
         Detection.reject_stars(stars, path, 5, out, center_dq_flags=jump)
     with pytest.raises(ValueError, match="center_flag_columns"):
@@ -429,8 +444,13 @@ def test_pipeline_output_paths_follow_format(monkeypatch, tmp_path, output_forma
     template = {"band": "F062", "observation_id": 2, "sca": 1}
     paths = instance.path_helper(science, template, science_image_path="science", template_image_path="template")
     suffix = ".parquet" if output_format == "parquet" else ".ecsv"
-    for key in ("star_catalog_path", "difference_truth_path", "difference_detection_path",
-                "cleaned_score_detection_path", "transients_to_detection_path"):
+    for key in (
+        "star_catalog_path",
+        "difference_truth_path",
+        "difference_detection_path",
+        "cleaned_score_detection_path",
+        "transients_to_detection_path",
+    ):
         assert paths[key].suffix == suffix
     assert paths["difference_image_path"].suffix == ".fits"
 

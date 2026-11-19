@@ -3,6 +3,7 @@ from pathlib import Path
 
 import astropy.units as u
 from astropy.table import Table
+
 # Move the astroquery.gaia import to only the function that needs it,
 # so we don't need astroquery or network access unless we actually want to retrieve from the Gaia archive
 # from astroquery.gaia import Gaia
@@ -41,7 +42,6 @@ def read_star_catalog(path, star_columns=("ra", "dec", "phot_g_mean_mag")):
             raise ValueError(f"Star catalog {path} is missing required columns: {sorted(missing)}")
 
     return stars
-
 
 
 def retrieve_gaia_stars(ra, dec, radius, max_mag=None, gaia_source_table="gaiadr3.gaia_source"):
@@ -108,7 +108,9 @@ def main():
 
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument("image_path", type=str, help="ASDF image to cover.")
-    parser.add_argument("-o", "--output", type=str, default=None, help="Output catalog.  Default: <image stem>_gaia.parquet")
+    parser.add_argument(
+        "-o", "--output", type=str, default=None, help="Output catalog.  Default: <image stem>_gaia.parquet"
+    )
     parser.add_argument("--max-mag", type=float, default=None, help="Only include stars with G brighter than this.")
     args = parser.parse_args()
 
