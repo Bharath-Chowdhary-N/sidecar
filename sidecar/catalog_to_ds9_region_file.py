@@ -1,11 +1,11 @@
 import argparse
 
-from sidecar.util import write_ds9_regions_from_ecsv
+from sidecar.util import write_ds9_regions_from_catalog
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("ecsv_catalog_path", type=str)
+    parser.add_argument("catalog_path", type=str)
     parser.add_argument("--ds9-region-path", type=str, default=None)
     parser.add_argument("--peak-value-threshold", type=float, default=25)
     parser.add_argument("--ra-column", type=str, default="ra")
@@ -18,10 +18,10 @@ def main():
 
     ds9_region_path = args.ds9_region_path
     if ds9_region_path is None:
-        ds9_region_path = args.ecsv_catalog_path[: args.ecsv_catalog_path.rfind(".")] + ".reg"
+        ds9_region_path = args.catalog_path[: args.catalog_path.rfind(".")] + ".reg"
 
-    write_ds9_regions_from_ecsv(
-        args.ecsv_catalog_path,
+    write_ds9_regions_from_catalog(
+        args.catalog_path,
         ds9_region_path=ds9_region_path,
         peak_value_threshold=args.peak_value_threshold,
         ra_column=args.ra_column,

@@ -15,7 +15,7 @@ import astropy.units as u
 from roman_datamodels import dqflags
 
 from sidecar import star_retrieval
-from sidecar.catalog_io import write_catalog
+from sidecar.catalog_io import OUTPUT_FORMATS, read_catalog, write_catalog
 from sidecar import subtraction
 from sidecar import truth_matching
 from sidecar import truth_retrieval
@@ -136,7 +136,10 @@ class Detection:
         single_pixel_min_r2_r3=DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
         single_pixel_min_peak_r3=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
         single_pixel_area_atol=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
+        output_format="parquet",
     ):
+        if output_format not in OUTPUT_FORMATS:
+            raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
         if not np.isfinite(cleaned_score_min_snr) or cleaned_score_min_snr < 0:
             raise ValueError("cleaned_score_min_snr must be finite and nonnegative")
         center_dq_flags = _validate_dq_mask(center_dq_flags)
@@ -158,6 +161,7 @@ class Detection:
         )
 
         self.image_collection = image_collection
+        self.output_format = output_format
         self.data_records = data_records
         self.psf_type = psf_type
         self.psf_size = psf_size
@@ -222,6 +226,7 @@ class Detection:
         science_truth_path,
         template_truth_path,
         difference_truth_path,
+        output_format="parquet",
     ):
         science_wcs = science_image.get_wcs()
         template_wcs = template_image.get_wcs()
@@ -231,7 +236,7 @@ class Detection:
         truth = truth_retrieval.merge_science_and_template_truth(
             science_truth, template_truth, science_wcs, template_wcs, offset=50
         )
-        write_catalog(truth, difference_truth_path, overwrite=True)
+        write_catalog(truth, difference_truth_path, overwrite=True, output_format=output_format)
         return truth
 
     @staticmethod
@@ -246,6 +251,7 @@ class Detection:
         x_col="X_IMAGE",
         y_col="Y_IMAGE",
         id_col="id",
+        output_format="parquet",
     ):
         """Match a truth catalog to subtraction detection catalogs
 
@@ -275,7 +281,7 @@ class Detection:
         """
         difference_wcs = load_wcs_from_fits(difference_image_path, hdu_id=0)
 
-        detection = Table.read(difference_detection_path, format="ascii")
+        detection = read_catalog(difference_detection_path)
         transients = truth[truth["object_type"] == "transient"]
         transients_skycoord = SkyCoord(transients["object_ra"], transients["object_dec"], frame=frame, unit="deg")
         detection_skycoord = pixel_to_skycoord(detection[x_col], detection[y_col], difference_wcs)
@@ -286,15 +292,19 @@ class Detection:
             detection, transients, detection_skycoord, transients_skycoord, match_radius, key=id_col
         )
 
-        write_catalog(transients_to_detection, transients_to_detection_path, overwrite=True)
-        write_catalog(detection_to_transients, detection_to_transients_path, overwrite=True)
+        write_catalog(
+            transients_to_detection, transients_to_detection_path, overwrite=True, output_format=output_format
+        )
+        write_catalog(
+            detection_to_transients, detection_to_transients_path, overwrite=True, output_format=output_format
+        )
         return transients_to_detection, detection_to_transients
 
     @staticmethod
-    def retrieve_stars(science_image, star_catalog_path, max_mag=None):
+    def retrieve_stars(science_image, star_catalog_path, max_mag=None, output_format="parquet"):
         """Retrieve Gaia DR3 stars covering the science image and save them to star_catalog_path."""
         stars = star_retrieval.retrieve_gaia_stars_for_image(science_image, max_mag=max_mag)
-        write_catalog(stars, star_catalog_path, overwrite=True)
+        write_catalog(stars, star_catalog_path, overwrite=True, output_format=output_format)
         return stars
 
     @staticmethod
@@ -313,6 +323,7 @@ class Detection:
         center_dq_flags=0,
         single_pixel_product=None,
         single_pixel_options=None,
+        output_format="parquet",
         **radius_kwargs,
     ):
         """Reject stars from subtraction detection catalogs
@@ -361,7 +372,7 @@ class Detection:
             raise ValueError("center_flag_columns must be provided when center_dq_flags is nonzero")
         if center_dq_flags and not isinstance(center_flag_columns, str) and len(center_flag_columns) == 0:
             raise ValueError("center_flag_columns must not be empty when center_dq_flags is nonzero")
-        detection = Table.read(difference_detection_path, format="ascii")
+        detection = read_catalog(difference_detection_path)
         cleaned_detection = util.reject_stars(
             detection, stars, match_radius, frame=frame, ra_col=ra_col, dec_col=dec_col, **radius_kwargs
         )
@@ -403,7 +414,7 @@ class Detection:
                 )
             cleaned_detection = cleaned_detection[~suspects]
 
-        write_catalog(cleaned_detection, cleaned_difference_detection_path, overwrite=True)
+        write_catalog(cleaned_detection, cleaned_difference_detection_path, overwrite=True, output_format=output_format)
 
         return cleaned_detection
 
@@ -516,6 +527,11 @@ class Detection:
             file_path["full_output_dir"],
             self.CLEANED_SCORE_DETECTION_TO_TRANSIENTS_PREFIX + diff_pattern + ".ecsv",
         )
+        if self.output_format == "parquet":
+            file_path = {
+                key: value.with_suffix(".parquet") if isinstance(value, Path) and value.suffix == ".ecsv" else value
+                for key, value in file_path.items()
+            }
         return file_path
 
     @staticmethod
@@ -650,7 +666,9 @@ class Detection:
                 stars = star_retrieval.read_star_catalog(self.input_star_catalog_path)
             else:
                 SNLogger.info("Retrieving Gaia DR3 stars")
-                stars = self.__class__.retrieve_stars(subtract.science_image, file_path["star_catalog_path"])
+                stars = self.__class__.retrieve_stars(
+                    subtract.science_image, file_path["star_catalog_path"], output_format=self.output_format
+                )
             subtract.detection_kwargs = {**subtract.detection_kwargs, "star_catalog": stars}
 
         if not assume_subtraction_has_been_run:
@@ -682,6 +700,7 @@ class Detection:
                         "science": science_image,
                     },
                     catalog_save_path=file_path["simple_difference_detection_path"],
+                    output_format=self.output_format,
                     detect_kwargs={
                         "coverage_mask": self.__class__.load_no_coverage_mask(file_path["simple_difference_image_path"])
                     },
@@ -698,6 +717,7 @@ class Detection:
                     "science": science_image,
                 },
                 catalog_save_path=file_path["difference_detection_path"],
+                output_format=self.output_format,
                 detect_kwargs={
                     "coverage_mask": self.__class__.load_no_coverage_mask(file_path["difference_image_path"])
                 },
@@ -715,6 +735,7 @@ class Detection:
                     "science": science_image,
                 },
                 catalog_save_path=file_path["score_detection_path"],
+                output_format=self.output_format,
                 detect_kwargs={"coverage_mask": self.__class__.load_no_coverage_mask(file_path["score_image_path"])},
             )
         except Exception as e:
@@ -733,6 +754,7 @@ class Detection:
                     center_dq_flags=self.center_dq_flags,
                     single_pixel_product="simple_diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    output_format=self.output_format,
                 )
 
             SNLogger.info("Removing known stars from diffim image detection")
@@ -747,6 +769,7 @@ class Detection:
                     file_path["cleaned_difference_detection_path"],
                     single_pixel_product="diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    output_format=self.output_format,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -768,6 +791,7 @@ class Detection:
                     min_abs_snr=self.cleaned_score_min_snr,
                     single_pixel_product="score" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    output_format=self.output_format,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -849,6 +873,7 @@ class Detection:
                 file_path["science_truth_path"],
                 file_path["template_truth_path"],
                 file_path["difference_truth_path"],
+                output_format=self.output_format,
             )
         except FileNotFoundError as e:
             SNLogger.info("Unable to retrieve truth catalog.  No star rejection or matching performed.")
@@ -866,6 +891,7 @@ class Detection:
             x_col="x_centroid",
             y_col="y_centroid",
             id_col="id",
+            output_format=self.output_format,
         )
 
         SNLogger.info("Processing score image detection truth matching")
@@ -879,6 +905,7 @@ class Detection:
             x_col="x_centroid",
             y_col="y_centroid",
             id_col="id",
+            output_format=self.output_format,
         )
 
         if reject_known_stars:
@@ -893,6 +920,7 @@ class Detection:
                 x_col="x_centroid",
                 y_col="y_centroid",
                 id_col="id",
+                output_format=self.output_format,
             )
 
             SNLogger.info("Processing cleaned score image detection truth matching")
@@ -906,6 +934,7 @@ class Detection:
                 x_col="x_centroid",
                 y_col="y_centroid",
                 id_col="id",
+                output_format=self.output_format,
             )
 
         SNLogger.info("Processing match_truth finished.")
@@ -973,7 +1002,7 @@ class Detection:
                 "observation_id": template_observation_id,
                 "sca": template_sca,
             }
-            file_path = Detection.path_helper(science_id, template_id)
+            file_path = self.path_helper(science_id, template_id)
             dia_source_catalog_path = file_path["cleaned_score_detection_path"]
 
             SNLogger.info(f"Saving candidates from {dia_source_catalog_path}")
@@ -1114,6 +1143,12 @@ def main():
     )
     parser.add_argument("-t", "--temp-dir", type=str, default=None, help="Temporary directory.")
     parser.add_argument("-o", "--output-dir", type=str, default=None, help="Output path")
+    parser.add_argument(
+        "--catalog-output-format",
+        choices=OUTPUT_FORMATS,
+        default="parquet",
+        help="Catalog output format (default: %(default)s).",
+    )
     parser.add_argument(
         "--save-debug-products",
         default=False,
@@ -1431,6 +1466,7 @@ def main():
         reject_known_stars=args.reject_known_stars,
         temp_dir=args.temp_dir,
         output_dir=args.output_dir,
+        output_format=args.catalog_output_format,
         backend4subtract=args.backend4subtract,
         cross_convolve=args.cross_convolve,
         save_debug_products=args.save_debug_products,

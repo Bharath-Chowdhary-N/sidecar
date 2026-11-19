@@ -412,6 +412,7 @@ def detect_and_measure_sources(
     catalog_save_path=None,
     overwrite=True,
     detect_kwargs=None,
+    output_format="parquet",
     **measure_kwargs,
 ):
     """Detect sources in a subtraction image and measure them on all provided images.
@@ -428,6 +429,8 @@ def detect_and_measure_sources(
         Overwrite an existing `catalog_save_path`.
     detect_kwargs : dict, optional
         Passed to `detect_sources_in_subtraction`.
+    output_format : {"ecsv", "parquet"}
+        Catalog output format
     **measure_kwargs
         Passed to `measure_sources`.
 
@@ -443,5 +446,5 @@ def detect_and_measure_sources(
         )
     catalog = measure_sources(detections, measurement_images, **measure_kwargs)
     if catalog_save_path is not None:
-        write_catalog(catalog, catalog_save_path, overwrite=overwrite)
+        write_catalog(catalog, catalog_save_path, overwrite=overwrite, output_format=output_format)
     return catalog

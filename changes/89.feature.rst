@@ -1,0 +1,1 @@
+Adds option for ecsv or parquet.  Makes parquet default.
