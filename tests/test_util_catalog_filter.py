@@ -10,5 +10,7 @@ def test_catalog_filter(tmp_path):
         simple_table.write(test_path, format="ascii.ecsv" if fmt == "ecsv" else "parquet")
         sel, o = filter_catalog_by_abs_threshold(test_path, "s", 5, prefix="sel_")
         assert len(sel) == 2 and o.suffix == "." + ext
-        write_ds9_regions_from_catalog(o, ds9_region_path=tmp_path / "x.reg", peak_value_column="s", peak_value_threshold=None)
+        write_ds9_regions_from_catalog(
+            o, ds9_region_path=tmp_path / "x.reg", peak_value_column="s", peak_value_threshold=None
+        )
         assert (tmp_path / "x.reg").read_text().count("circle") == 2

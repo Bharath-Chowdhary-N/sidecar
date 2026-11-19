@@ -7,7 +7,6 @@ import pandas as pd
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.table import Table
 from astropy.wcs import WCS
 
 from sidecar.catalog_io import read_catalog, write_catalog

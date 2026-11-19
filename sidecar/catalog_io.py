@@ -11,6 +11,7 @@ from astropy.table import Table
 SUFFIXES = {"ecsv": (".ecsv"), "parquet": (".parquet", ".pq")}
 OUTPUT_FORMATS = tuple(SUFFIXES.keys())
 
+
 def _write_parquet(table, path):
     # Write to a temporary name then rename so readers never see a partial file.
     tmp = Path(str(path) + f".tmp{os.getpid()}")

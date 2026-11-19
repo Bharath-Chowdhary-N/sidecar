@@ -16,11 +16,18 @@ def main():
     parser.add_argument("catalog", type=str, help="ECSV or Parquet catalog with ra, dec columns in degrees")
     parser.add_argument("star_catalog", type=str, help="Reference star ECSV or Parquet with ra, dec, magnitude")
     parser.add_argument(
-        "-o", "--output", type=str, default=None,
+        "-o",
+        "--output",
+        type=str,
+        default=None,
         help="Output catalog path. Default: cleaned_<catalog stem> with the appropriate extension.",
     )
-    parser.add_argument("--catalog-output-format", choices=OUTPUT_FORMATS, default="parquet",
-                        help="Output format (default: %(default)s)")
+    parser.add_argument(
+        "--catalog-output-format",
+        choices=OUTPUT_FORMATS,
+        default="parquet",
+        help="Output format (default: %(default)s)",
+    )
     parser.add_argument("--match-radius", type=float, default=5.0, help="Base rejection radius in arcsec")
     parser.add_argument("--ref-mag", type=float, default=None, help="Stars brighter than this get a larger radius")
     parser.add_argument("--scale", type=float, default=0.2, help="Radius grows as 10**(scale * (ref_mag - mag))")

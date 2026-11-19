@@ -430,7 +430,7 @@ def detect_and_measure_sources(
     detect_kwargs : dict, optional
         Passed to `detect_sources_in_subtraction`.
     output_format : {"ecsv", "parquet"}
-        Catalog output format 
+        Catalog output format
     **measure_kwargs
         Passed to `measure_sources`.
 

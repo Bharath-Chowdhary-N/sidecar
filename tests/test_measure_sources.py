@@ -69,8 +69,8 @@ def test_measure_sources_recovers_flux_and_flags(tmp_path, output_format):
     cat = detect_and_measure_sources(diff, images, out_path, bad_pixel_flags=2**3, output_format=output_format)
 
     assert out_path.exists()
-    assert (tmp_path / "det.ecsv").exists() == (output_format in ("ecsv", ))
-    assert (tmp_path / "det.parquet").exists() == (output_format in ("parquet", ))
+    assert (tmp_path / "det.ecsv").exists() == (output_format in ("ecsv",))
+    assert (tmp_path / "det.parquet").exists() == (output_format in ("parquet",))
     assert len(Table.read(out_path)) == len(cat)
     assert len(cat) >= 2
     for x, y, flux in sources:

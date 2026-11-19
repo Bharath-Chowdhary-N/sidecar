@@ -292,8 +292,12 @@ class Detection:
             detection, transients, detection_skycoord, transients_skycoord, match_radius, key=id_col
         )
 
-        write_catalog(transients_to_detection, transients_to_detection_path, overwrite=True, output_format=output_format)
-        write_catalog(detection_to_transients, detection_to_transients_path, overwrite=True, output_format=output_format)
+        write_catalog(
+            transients_to_detection, transients_to_detection_path, overwrite=True, output_format=output_format
+        )
+        write_catalog(
+            detection_to_transients, detection_to_transients_path, overwrite=True, output_format=output_format
+        )
         return transients_to_detection, detection_to_transients
 
     @staticmethod
@@ -525,9 +529,7 @@ class Detection:
         )
         if self.output_format == "parquet":
             file_path = {
-                key: value.with_suffix(".parquet")
-                if isinstance(value, Path) and value.suffix == ".ecsv"
-                else value
+                key: value.with_suffix(".parquet") if isinstance(value, Path) and value.suffix == ".ecsv" else value
                 for key, value in file_path.items()
             }
         return file_path
