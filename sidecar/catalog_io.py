@@ -25,6 +25,7 @@ def _write_parquet(table, path):
 
 def write_catalog(table, path, overwrite=True, output_format="parquet"):
     """Write a Parquet or ECSV format catalog at the specified path."""
+    path = Path(path)
     if not overwrite:
         if path.exists():
             raise FileExistsError(f"Catalog already exists: {path}")
