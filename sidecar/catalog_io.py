@@ -6,6 +6,8 @@ from pathlib import Path
 
 from astropy.table import Table
 
+# Global to be referenced by other parts to get a consistent list of output formats.
+OUTPUT_FORMATS = ("ecsv", "parquet", "both")
 
 def _write_parquet(table, path):
     # Write to a temporary name then rename so readers never see a partial file.
@@ -20,7 +22,6 @@ def _write_parquet(table, path):
 
 def catalog_output_paths(path, output_format="parquet"):
     """Return output paths; `both` uses the ECSV path as its primary path."""
-    OUTPUT_FORMATS = ("ecsv", "parquet", "both")
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
     path = Path(path)
