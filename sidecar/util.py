@@ -654,7 +654,7 @@ def filter_catalog_by_abs_threshold(
         output_path = catalog_path.with_name(prefix + catalog_path.name)
     output_path = Path(output_path)
     suffix = output_path.suffix.lower()
-    if suffix == ".parquet":
+    if suffix in (".parquet", ".pq"):
         output_format = "parquet"
     elif suffix == ".ecsv":
         output_format = "ecsv"
