@@ -117,7 +117,11 @@ def main():
     output = args.output or Path(args.image_path).with_suffix("").name + "_gaia.parquet"
     image = RomanDatamodelImage(args.image_path, no_base_path=True)
     stars = retrieve_gaia_stars_for_image(image, max_mag=args.max_mag)
-    stars.write(output, format="parquet", overwrite=True)
+    suffix = Path(output).suffix.lower()
+    if suffix not in (".ecsv", ".parquet", ".pq"):
+        parser.error("Output catalog must use .ecsv, .parquet, or .pq")
+    output_format = "ascii.ecsv" if suffix == ".ecsv" else "parquet"
+    stars.write(output, format=output_format, overwrite=True)
     print(f"Wrote {len(stars)} stars to {output}")
 
 
