@@ -1272,7 +1272,8 @@ def main():
         "--star-rejection-ref-mag",
         type=lambda value: None if value.lower() == "none" else float(value),
         default=Detection.REJECT_REF_MAG,
-        help="Stars brighter than this Gaia G magnitude get a larger radius (default %(default)s); 'none' disables scaling.",
+        help="Stars brighter than this Gaia G magnitude get a larger radius (default %(default)s); "
+        "'none' disables scaling.",
     )
     parser.add_argument(
         "--star-rejection-scale",
