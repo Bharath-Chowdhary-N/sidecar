@@ -451,7 +451,7 @@ class Detection:
             raise ValueError("snr_column and min_abs_snr must be provided together")
         if snr_column is not None:
             if not np.isfinite(min_abs_snr) or min_abs_snr < 0:
-                raise ValueError("min_abs_snr mustbe finite and nonnegative")
+                raise ValueError("min_abs_snr must be finite and nonnegative")
             snr = np.ma.asarray(cleaned_detection[snr_column], dtype=float)
             good = np.ma.filled(np.isfinite(snr) & (np.abs(snr) >= min_abs_snr), False)
             SNLogger.info(f"Removing {np.count_nonzero(~good)} detections below the absolute S/N threshold")
@@ -644,7 +644,7 @@ class Detection:
              written to the `*_detection_path` files.
           5. If `reject_known_stars`, write `cleaned_*` catalogs with sources matching known stars removed.
              Also reject bad or unmeasured pixels in simple-difference and score apertures, and apply the
-             the configured aperture S/N cuts, and the enabled single-pixel concentration cuts.
+             configured aperture S/N cuts, and the enabled single-pixel concentration cuts.
           6. If `self.save_candidates_to_database`, save DiaObjects from the (cleaned, if made) score catalog.
 
         Uses instance settings for everything not passed as an argument: `cross_convolve`, `save_debug_products`,
