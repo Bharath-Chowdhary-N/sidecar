@@ -7,7 +7,13 @@ from astropy.wcs import WCS
 from snappl.image import FITSImage
 
 from sidecar.pipeline import Detection
-from sidecar.source_detection import detect_and_measure_sources, detect_sources_in_subtraction, measure_sources
+from sidecar.source_detection import (
+    detect_and_measure_sources,
+    detect_sources_in_subtraction,
+    find_square_pixel_suspects,
+    measure_sources,
+    measure_square_fluxes,
+)
 from sidecar.subtraction import _save_products_as_fits
 
 
@@ -95,6 +101,63 @@ def test_measure_sources_out_of_bounds_and_empty(tmp_path):
     assert np.isnan(out["sci_aper_r3_flux"][1])
     empty = measure_sources(Table({"ra": [], "dec": []}), {"sci": sci})
     assert len(empty) == 0 and "sci_aper_r3_flux" in empty.colnames
+    assert "sci_square_1_over_3" in empty.colnames
+
+
+def test_square_fluxes_background_mask_edges_and_noise():
+    data = np.full((9, 9), 10.0)
+    data[4, 4] += 90
+    data[4, 5] += 10
+    error = np.full(data.shape, 2.0)
+    result = measure_square_fluxes(data, [4.1, 0, np.nan], [4.1, 0, 4], background=10, error=error)
+    assert result["square_1_flux"][0] == 90
+    assert result["square_3_flux"][0] == 100
+    assert result["square_5_flux"][0] == 100
+    assert result["square_1_over_3"][0] == pytest.approx(0.9)
+    assert result["square_3_over_5"][0] == pytest.approx(1.0)
+    assert result["square_3_flux_err"][0] == pytest.approx(6)
+    assert np.isnan(result["square_3_flux"][1:]).all()
+    mask = np.zeros(data.shape, dtype=bool)
+    mask[3, 3] = True
+    masked = measure_square_fluxes(data, [4], [4], background=10, mask=mask, error=error)
+    assert masked["square_1_flux"][0] == 90
+    assert np.isnan(masked["square_3_flux"][0])
+    assert np.isnan(masked["square_1_over_3"][0])
+    error[3, 3] = 0
+    invalid_noise = measure_square_fluxes(data, [4], [4], background=10, error=error)
+    assert np.isnan(invalid_noise["square_3_flux"][0])
+    blank = measure_square_fluxes(np.zeros((5, 5)), [2], [2])
+    assert np.isnan(blank["square_1_over_3"][0])
+
+
+def test_measure_sources_square_fluxes_use_native_position_and_flags(tmp_path):
+    data = np.full((200, 200), 3.0)
+    data[60, 50] += 100
+    flags = np.zeros(data.shape, dtype=np.uint32)
+    flags[59, 49] = 8
+    image = _write_product(tmp_path / "sci.fits", data, _wcs(), flags=flags)
+    ra, dec = _wcs().pixel_to_world_values([50], [60])
+    row = measure_sources(Table({"ra": ra, "dec": dec}), {"sci": image}, bad_pixel_flags=8)[0]
+    assert row["sci_square_1_flux"] == pytest.approx(100)
+    assert np.isnan(row["sci_square_3_flux"])
+    assert np.isnan(row["sci_square_1_over_3"])
+
+
+def test_square_pixel_suspects_use_correct_input_and_keep_inconclusive():
+    cat = Table({"peak_value": [1, -1, 1, 1, -1], "diff_aper_r3_snr": [10, -10, 10, 10, 10]})
+    for image in ("science", "template"):
+        cat[f"{image}_square_3_snr"] = [30.0] * 5
+        cat[f"{image}_square_3_flux"] = [100.0] * 5
+        cat[f"{image}_square_1_over_3"] = [0.95] * 5
+        cat[f"{image}_square_3_over_5"] = [0.98] * 5
+    cat["science_square_1_over_3"][1] = 0.3
+    cat["template_square_1_over_3"][2] = 0.3
+    cat["science_square_3_snr"][3] = 5
+    suspect, measurable = find_square_pixel_suspects(cat, "diff")
+    assert suspect.tolist() == [True, True, True, False, False]
+    assert measurable.tolist() == [True, True, True, False, False]
+    cat["science_square_1_over_3"][2] = 0.3
+    assert not find_square_pixel_suspects(cat, "diff")[0][2]
 
 
 def test_detection_uses_coverage_and_local_rms(tmp_path):
@@ -127,11 +190,16 @@ def test_detection_uses_coverage_and_local_rms(tmp_path):
     assert detect_sources_in_subtraction(image, coverage_mask=mask, nsigma=1000, verbose=False) is None
     empty_path = tmp_path / "empty.ecsv"
     empty = detect_and_measure_sources(
-        image, {"diff": image}, empty_path, detect_kwargs={"coverage_mask": mask, "nsigma": 1000, "verbose": False}
+        image,
+        {"diff": image},
+        empty_path,
+        output_format="ecsv",
+        detect_kwargs={"coverage_mask": mask, "nsigma": 1000, "verbose": False},
     )
     assert len(empty) == 0
-    assert "ra" in Table.read(empty_path).colnames
+    assert "ra" in Table.read(empty_path, format="ascii.ecsv").colnames
     assert "diff_aper_r3_flux" in empty.colnames
+    assert "diff_square_1_over_3" in empty.colnames
 
 
 def test_detection_negative_only_and_invalid_coverage(tmp_path):

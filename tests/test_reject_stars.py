@@ -376,6 +376,40 @@ def test_single_pixel_rejection_keeps_inconclusive_and_point_source(tmp_path, pr
         Detection.reject_stars(stars, path, 5, out, single_pixel_product="missing")
 
 
+@pytest.mark.parametrize("product", ["simple_diff", "diff", "score"])
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_square_pixel_rejection_thresholds_and_inconclusive(tmp_path, product, output_format):
+    table = Table(
+        {
+            "id": [0, 1, 2, 3],
+            "ra": [10.0, 20.0, 30.0, 40.0],
+            "dec": [0.0] * 4,
+            "peak_value": [1.0, -1.0, 1.0, 1.0],
+            f"{product}_aper_r3_snr": [10.0, -10.0, 10.0, 10.0],
+        }
+    )
+    for image in ("science", "template"):
+        table[f"{image}_square_3_flux"] = [10.0] * 4
+        table[f"{image}_square_3_snr"] = [25.0, 25.0, 25.0, np.nan]
+        table[f"{image}_square_1_over_3"] = [0.85, 0.85, 0.5, 0.85]
+        table[f"{image}_square_3_over_5"] = [0.95] * 4
+    table["science_square_1_over_3"][1] = 0.5
+    path = tmp_path / "input.ecsv"
+    out = tmp_path / f"cleaned.{output_format}"
+    write_catalog(table, path, output_format="ecsv")
+    stars = Table({"ra": [], "dec": []})
+    cleaned = Detection.reject_stars(stars, path, 5, out, square_pixel_product=product, output_format=output_format)
+    assert list(cleaned["id"]) == [2, 3]
+    assert list(read_catalog(out)["id"]) == [2, 3]
+    for options in ({"min_snr": 26}, {"min_1_over_3": 0.9}, {"min_3_over_5": 0.96}):
+        cleaned = Detection.reject_stars(
+            stars, path, 5, out, square_pixel_product=product, square_pixel_options=options, output_format=output_format
+        )
+        assert list(cleaned["id"]) == [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="min_snr"):
+        Detection.reject_stars(stars, path, 5, out, square_pixel_product=product, square_pixel_options={"min_snr": -1})
+
+
 def test_center_flag_options_combine(monkeypatch, tmp_path):
     class TestConfig:
         def value(self, key, default=None):
@@ -394,6 +428,10 @@ def test_center_flag_options_combine(monkeypatch, tmp_path):
         Detection(**kwargs, center_dq_flags=2**32)
     with pytest.raises(ValueError, match="center flag columns"):
         Detection(**kwargs, reject_center_jump_det=True, center_flag_columns=[])
+    with pytest.raises(ValueError, match="cleaned_simple_min_snr"):
+        Detection(**kwargs, cleaned_simple_min_snr=np.nan)
+    with pytest.raises(ValueError, match="square_pixel_min_1_over_3"):
+        Detection(**kwargs, square_pixel_min_1_over_3=-1)
 
 
 @pytest.mark.parametrize("mode", ["default", "custom", "empty", "fixed"])
@@ -435,6 +473,15 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
             "0.8",
             "--single-pixel-area-atol",
             "0.2",
+            "--no-reject-square-pixel",
+            "--square-pixel-min-snr",
+            "25",
+            "--square-pixel-min-1-over-3",
+            "0.85",
+            "--square-pixel-min-3-over-5",
+            "0.92",
+            "--cleaned-simple-min-snr",
+            "5",
             "--catalog-output-format",
             "ecsv",
             "--star-rejection-match-radius",
@@ -468,6 +515,9 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
         assert detection.center_dq_flags == 4
         assert detection.output_format == "ecsv"
         assert not detection.reject_single_pixel
+        assert not detection.reject_square_pixel
+        assert detection.square_pixel_options == {"min_snr": 25, "min_1_over_3": 0.85, "min_3_over_5": 0.92}
+        assert detection.cleaned_simple_min_snr == 5
         assert detection.single_pixel_options == {
             "min_input_snr": 8,
             "min_r2_r3": 0.99,
@@ -482,6 +532,9 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
         assert detection.center_flag_columns == ["template_flags_center", "science_flags_center", "flags_center"]
         assert detection.center_dq_flags == 0
         assert detection.reject_single_pixel
+        assert detection.reject_square_pixel
+        assert detection.square_pixel_options == {"min_snr": 20, "min_1_over_3": 0.8, "min_3_over_5": 0.9}
+        assert detection.cleaned_simple_min_snr is None
         assert detection.output_format == "parquet"
 
 
@@ -564,30 +617,34 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
     monkeypatch.setattr(Detection, "reject_stars", staticmethod(capture_reject_stars))
     detections = Table(
         {
-            "id": [0, 1, 2],
-            "ra": [10.0, 20.0, 30.0],
-            "dec": [0.0, 0.0, 0.0],
-            "science_flags_npix_bad": [0, 1, 0],
-            "template_flags_npix_bad": [0, 0, 1],
-            "science_flags_center": [0, 0, 4],
-            "template_flags_center": [0, 4, 0],
-            "score_flags_npix_bad": [0, 1, 0],
-            "simple_diff_flags_npix_bad": [0, 0, 0],
-            "score_flags_center": [0, 0, 4],
-            "simple_diff_flags_center": [0, 4, 0],
-            "score_aper_r3_snr": [10.0, 10.0, 10.0],
-            "simple_diff_aper_r3_snr": [10.0, 10.0, 10.0],
-            "diff_aper_r3_snr": [10.0, 10.0, 10.0],
-            "peak_value": [1.0, 1.0, 1.0],
+            "id": [0, 1, 2, 3],
+            "ra": [10.0, 20.0, 30.0, 40.0],
+            "dec": [0.0] * 4,
+            "science_flags_npix_bad": [0, 1, 0, 0],
+            "template_flags_npix_bad": [0, 0, 1, 0],
+            "science_flags_center": [0, 0, 4, 0],
+            "template_flags_center": [0, 4, 0, 0],
+            "score_flags_npix_bad": [0, 1, 0, 0],
+            "simple_diff_flags_npix_bad": [0, 0, 0, 0],
+            "score_flags_center": [0, 0, 4, 0],
+            "simple_diff_flags_center": [0, 4, 0, 0],
+            "score_aper_r3_snr": [10.0, 10.0, 10.0, -10.0],
+            "simple_diff_aper_r3_snr": [4.0, 10.0, 10.0, -5.0],
+            "diff_aper_r3_snr": [10.0, 10.0, 10.0, -10.0],
+            "peak_value": [1.0, 1.0, 1.0, -1.0],
         }
     )
     for image in ("science", "template"):
-        detections[f"{image}_aper_r2_flux"] = [8.0, 8.0, 9.5]
-        detections[f"{image}_aper_r3_flux"] = [10.0, 10.0, 10.0]
-        detections[f"{image}_aper_r3_snr"] = [10.0, 10.0, 10.0]
-        detections[f"{image}_peak"] = [3.0, 3.0, 7.0]
+        detections[f"{image}_aper_r2_flux"] = [8.0, 8.0, 9.5, 8.0]
+        detections[f"{image}_aper_r3_flux"] = [10.0] * 4
+        detections[f"{image}_aper_r3_snr"] = [10.0] * 4
+        detections[f"{image}_peak"] = [3.0, 3.0, 7.0, 3.0]
+        detections[f"{image}_square_3_flux"] = [10.0] * 4
+        detections[f"{image}_square_3_snr"] = [25.0] * 4
+        detections[f"{image}_square_1_over_3"] = [0.5, 0.5, 0.5, 0.9 if image == "template" else 0.5]
+        detections[f"{image}_square_3_over_5"] = [0.95] * 4
         for r in (2, 3, 5):
-            detections[f"{image}_aper_r{r}_npix_valid"] = [np.pi * r**2] * 3
+            detections[f"{image}_aper_r{r}_npix_valid"] = [np.pi * r**2] * 4
     monkeypatch.setattr(
         pipeline,
         "detect_and_measure_sources",
@@ -638,3 +695,19 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
     )
     assert list(read_catalog(paths["cleaned_simple_difference_detection_path"])["id"]) == [0, 2]
     assert list(read_catalog(paths["cleaned_difference_detection_path"])["id"]) == [0, 1, 2]
+    instance.reject_single_pixel = True
+    instance.reject_square_pixel = False
+    instance.cleaned_simple_min_snr = 5
+    instance.run_one_subtraction(
+        SimpleNamespace(get_image=lambda path: object()),
+        "F062",
+        1,
+        1,
+        "F062",
+        2,
+        1,
+        assume_subtraction_has_been_run=True,
+    )
+    assert list(read_catalog(paths["cleaned_simple_difference_detection_path"])["id"]) == [3]
+    assert list(read_catalog(paths["cleaned_score_detection_path"])["id"]) == [0, 3]
+    assert list(read_catalog(paths["cleaned_difference_detection_path"])["id"]) == [0, 1, 3]
