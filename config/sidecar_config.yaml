@@ -24,5 +24,14 @@ photometry:
       threshold: 100
       threshold_column: "peak_value"
 
+    real_bogus:
+      # Detections with real_bogus_score >= threshold are labelled "real".
+      threshold: 0.5
+      # Where the Hugging Face model ensemble is downloaded and cached.
+      # null -> ~/roman_sn_pit_models
+      model_dir: null
+      # Where to run the CNNs: auto (GPU if available), cpu, or cuda.
+      device: auto
+
     psf:
       type: STPSF

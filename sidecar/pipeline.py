@@ -10,10 +10,10 @@ from astropy.table import Table
 from astropy.wcs.utils import pixel_to_skycoord
 import astropy.units as u
 
+from sidecar import classifier
 from sidecar import subtraction
 from sidecar import truth_matching
 from sidecar import truth_retrieval
-from sidecar import classifier
 from sidecar.database import save_dia_objects_from_subtraction
 from sidecar.source_detection import detect_sources
 from sidecar.util import (
@@ -61,6 +61,7 @@ class Detection:
     SCORE_DETECTION_PREFIX = "score_detection_"
     CLEANED_DIFF_DETECTION_PREFIX = "cleaned_" + DIFF_DETECTION_PREFIX
     CLEANED_SCORE_DETECTION_PREFIX = "cleaned_" + SCORE_DETECTION_PREFIX
+    REAL_BOGUS_PREFIX = "real_bogus_"
     DIFF_TRUTH_PREFIX = "truth_"
     TRANSIENTS_TO_DETECTION_PREFIX = "transients_to_detection_"
     DETECTION_TO_TRANSIENTS_PREFIX = "detection_to_transients_"
@@ -78,6 +79,8 @@ class Detection:
         psf_type="STPSF",
         psf_size=None,
         reject_known_stars=True,
+        real_bogus=True,
+        rb_device=None,
         cross_convolve=False,
         backend4subtract=None,
         save_debug_products=False,
@@ -110,6 +113,12 @@ class Detection:
         self.psf_type = psf_type
         self.psf_size = psf_size
         self.reject_known_stars = reject_known_stars
+        self.real_bogus = real_bogus
+        # CLI/constructor value wins; otherwise the config value; otherwise "auto".
+        if rb_device is not None:
+            self.rb_device = rb_device
+        else:
+            self.rb_device = self.config.value("photometry.sidecar.real_bogus.device", default="auto")
         self.cross_convolve = cross_convolve
 
         self.save_debug_products = save_debug_products
@@ -343,6 +352,15 @@ class Detection:
             file_path["full_output_dir"],
             self.CLEANED_SCORE_DETECTION_PREFIX + diff_pattern + ".ecsv",
         )
+        # real/bogus classification
+        file_path["real_bogus_score_detection_path"] = Path(
+            file_path["full_output_dir"],
+            self.REAL_BOGUS_PREFIX + self.SCORE_DETECTION_PREFIX + diff_pattern + ".parquet",
+        )
+        file_path["real_bogus_cleaned_score_detection_path"] = Path(
+            file_path["full_output_dir"],
+            self.REAL_BOGUS_PREFIX + self.CLEANED_SCORE_DETECTION_PREFIX + diff_pattern + ".parquet",
+        )
         file_path["transients_to_score_detection_path"] = Path(
             file_path["full_output_dir"],
             self.TRANSIENTS_TO_SCORE_DETECTION_PREFIX + diff_pattern + ".ecsv",
@@ -376,6 +394,7 @@ class Detection:
         psf_size=None,
         temp_dir=None,
         reject_known_stars=True,
+        real_bogus=True,
         cross_convolve=False,
         backend4subtract="Cupy",
     ):
@@ -488,6 +507,22 @@ class Detection:
                 y_col="y_peak",
             )
 
+        if real_bogus:
+            # Score the star-cleaned catalog when star rejection ran, otherwise the raw
+            # score-image detections. Needs no truth, so this also runs on real data.
+            rb_input_key = "cleaned_score_detection_path" if reject_known_stars else "score_detection_path"
+            rb_catalog_path = file_path[rb_input_key]
+            SNLogger.info(f"Adding real/bogus classifier scores to {rb_catalog_path.name}")
+            # cutout_size is not configurable: it is fixed by the trained models (64x64).
+            classifier.process_single_catalog_ensemble(
+                catalog_path=rb_catalog_path,
+                fits_path=file_path["difference_image_path"],
+                output_path=file_path[f"real_bogus_{rb_input_key}"],
+                model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir", default=None),
+                threshold=self.config.value("photometry.sidecar.real_bogus.threshold", default=0.5),
+                device=self.rb_device,
+            )
+
         SNLogger.info("Processing subtraction finished.")
 
     def run_one_match_truth(
@@ -500,8 +535,6 @@ class Detection:
         template_observation_id,
         template_sca,
         temp_dir,
-        science_image_path=None,
-        template_image_path=None,
         reject_known_stars=True,
     ):
         science_id = {
@@ -514,9 +547,7 @@ class Detection:
             "observation_id": template_observation_id,
             "sca": template_sca,
         }
-        file_path = self.path_helper(
-            science_id, template_id, science_image_path=science_image_path, template_image_path=template_image_path
-        )
+        file_path = self.path_helper(science_id, template_id)
 
         SNLogger.info(
             "Processing match truth started for data records "
@@ -524,19 +555,12 @@ class Detection:
             f"| Template ID {template_id} "
         )
 
-        if science_image_path is not None:
-            science_image = image_collection.get_image(path=science_image_path)
-        else:
-            science_image = image_collection.get_image(
-                **{"band": science_band, "observation_id": science_observation_id, "sca": science_sca},
-            )
-
-        if template_image_path is not None:
-            template_image = image_collection.get_image(path=template_image_path)
-        else:
-            template_image = image_collection.get_image(
-                **{"band": template_band, "observation_id": template_observation_id, "sca": template_sca},
-            )
+        science_image = image_collection.get_image(
+            **{"band": science_band, "observation_id": science_observation_id, "sca": science_sca},
+        )
+        template_image = image_collection.get_image(
+            **{"band": template_band, "observation_id": template_observation_id, "sca": template_sca},
+        )
 
         SNLogger.info("Processing truth retrieval")
         try:
@@ -550,19 +574,6 @@ class Detection:
         except FileNotFoundError as e:
             SNLogger.info("Unable to retrieve truth catalog.  No star rejection or matching performed.")
             print(e)
-
-            # TEMPORARY: bypass star rejection (requires truth) and run the classifier
-            # directly on the raw score detections. Revert this block once truth
-            # catalogs are available / no longer needed for this run.
-            SNLogger.info("Adding ML classifier predictions to score detection catalog (no truth available)")
-            classifier.process_single_catalog_ensemble(
-                catalog_path=file_path["score_detection_path"],
-                fits_path=file_path["difference_image_path"],
-                output_path=file_path["score_detection_path"].parent /
-                            f"{file_path['score_detection_path'].stem}_with_predictions.ecsv",
-                cutout_size=64,
-                threshold=0.5,
-            )
             return
 
         SNLogger.info("Processing diffim detection truth matching")
@@ -576,40 +587,6 @@ class Detection:
             x_col="x_centroid",
             y_col="y_centroid",
             id_col="id",
-        )
-
-        SNLogger.info("Processing cleaned diffim detection truth matching")
-        _, _ = self.__class__.match_transients(
-            truth,
-            file_path["difference_image_path"],
-            file_path["cleaned_difference_detection_path"],
-            self.MATCH_RADIUS,
-            file_path["transients_to_cleaned_detection_path"],
-            file_path["cleaned_detection_to_transients_path"],
-            x_col="X_IMAGE",
-            y_col="Y_IMAGE",
-            id_col="NUMBER",
-        )
-
-        SNLogger.info("Removing known stars from score image detection")
-        _ = self.__class__.reject_stars(
-            truth,
-            file_path["difference_image_path"],
-            file_path["score_detection_path"],
-            self.REJECT_MATCH_RADIUS,
-            file_path["cleaned_score_detection_path"],
-            x_col="x_peak",
-            y_col="y_peak",
-        )
-
-        SNLogger.info("Adding ML classifier predictions to cleaned score detection catalog")
-        classifier.process_single_catalog_ensemble(
-            catalog_path=file_path["cleaned_score_detection_path"],
-            fits_path=file_path["difference_image_path"],
-            output_path=file_path["cleaned_score_detection_path"].parent /
-                        f"{file_path['cleaned_score_detection_path'].stem}_with_predictions.ecsv",
-            cutout_size=64,
-            threshold=0.5,
         )
 
         SNLogger.info("Processing score image detection truth matching")
@@ -681,20 +658,12 @@ class Detection:
                 psf_size=self.psf_size,
                 temp_dir=temp_dir,
                 reject_known_stars=self.reject_known_stars,
+                real_bogus=self.real_bogus,
                 backend4subtract=self.backend4subtract,
             )
 
     def run_match_truth(self):
         os.makedirs(self.output_dir, exist_ok=True)
-
-        # create temporary directory
-        if self.temp_dir is None:
-            temp_dir_obj = tempfile.TemporaryDirectory()
-            temp_dir = Path(temp_dir_obj.name)
-            atexit.register(temp_dir_obj.cleanup)
-        else:
-            temp_dir = Path(self.temp_dir)
-            os.makedirs(temp_dir, exist_ok=True)
 
         for _, row in self.data_records.iterrows():
             self.run_one_match_truth(
@@ -705,10 +674,6 @@ class Detection:
                 row["template_band"],
                 row["template_observation_id"],
                 row["template_sca"],
-                temp_dir,
-                science_image_path=row.get("science_image_path") or None,
-                template_image_path=row.get("template_image_path") or None,
-                reject_known_stars=self.reject_known_stars,
             )
 
     def save_candidates_to_database(self):
@@ -866,6 +831,21 @@ def main():
         help="Reject known stars.  Requires an available catalog of known stars.",
     )
     parser.add_argument(
+        "--real-bogus",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Add CNN real/bogus scores to the score detection catalog.  "
+        "Downloads the model ensemble from Hugging Face on first use.",
+    )
+    parser.add_argument(
+        "--rb-device",
+        type=str,
+        default=None,
+        choices=["auto", "cpu", "cuda"],
+        help="Where to run the real/bogus CNNs: 'auto' (GPU if available), 'cpu' or 'cuda'.  "
+        "Defaults to photometry.sidecar.real_bogus.device in the config, else 'auto'.",
+    )
+    parser.add_argument(
         "--match-truth", default=False, action=argparse.BooleanOptionalAction, help="Match to truth catalog."
     )
     parser.add_argument("-t", "--temp-dir", type=str, default=None, help="Temporary directory.")
@@ -979,6 +959,8 @@ def main():
         psf_type=args.psf_type,
         psf_size=args.psf_size,
         reject_known_stars=args.reject_known_stars,
+        real_bogus=args.real_bogus,
+        rb_device=args.rb_device,
         temp_dir=args.temp_dir,
         output_dir=args.output_dir,
         backend4subtract=args.backend4subtract,

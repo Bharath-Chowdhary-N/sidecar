@@ -1,24 +1,29 @@
-#!/usr/bin/env python3
-"""User: BCN.
+"""Real/bogus classification of difference-image detections.
 
-Date: Jan 30 2026
-Merged script: Makes cutouts on-the-fly and adds CNN predictions to ECSV catalog.
-No cutout files are saved - only predictions are added to the catalog.
+This module scores each detection in a sidecar detection catalog as a real
+astrophysical transient or a bogus detection (subtraction artefact, noise
+spike, residual of a bright source, ...).
 
-Expected directory structure:
-    dia_out_dir/
-        R062_56618_18_-_R062_2344_8/
-            cleaned_score_detection_R062_56618_18_-_R062_2344_8.ecsv
-            decorr_diff_R062_56618_18_-_R062_2344_8.fits
-        (other similar subdirectories...)
+The entry point is :func:`process_single_catalog_ensemble`. It
 
-ECSV format expected:
-    Columns: id, x_peak, y_peak, peak_value, x_centroid, y_centroid, ra, dec
+1. loads the 24-model CNN ensemble published on Hugging Face as
+   ``Roman-Supernova-PIT/transient-real-bogus`` (6 architecture families x 4
+   independently trained members), downloading it on first use and caching it
+   locally;
+2. reads the detection catalog (ECSV) and the difference image (FITS) the
+   detections were measured on;
+3. for every detection, makes a 64x64 cutout centred on its position, in
+   memory, and scores it with every model;
+4. writes the catalog out as Parquet with per-family scores, the ensemble
+   score, its spread, and a "real"/"bogus"/"invalid" label added as columns.
 
-Output:
-    Saves: cleaned_score_detection_<folder_name>_with_predictions.ecsv
-    Added columns: cnn_prediction (1/0/-1), cnn_probability (0-1 or NaN)
-    Added metadata: cnn_threshold, cnn_model, cnn_cutout_size
+It is called from ``sidecar/pipeline.py`` (``Detection.run_one_subtraction``)
+after source detection and optional known-star rejection, and needs no truth
+catalog, so it runs on real data as well as simulations.
+
+Preprocessing must match training exactly: the whole difference image is
+z-scaled to [0, 1], a sub-pixel bilinear cutout is taken from it, and that
+cutout is z-scaled to [0, 1] again (see :func:`make_model_cutout`).
 """
 
 import glob
@@ -28,19 +33,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from astropy.io import ascii, fits
-from pathlib import Path
-from tqdm import tqdm
-import warnings
-
-warnings.filterwarnings('ignore')
+from scipy.interpolate import RegularGridInterpolator
+from snappl.logger import SNLogger
 
 
 # ============================================================================
-# CNN MODEL DEFINITION (from CNN_prediction.py)
+# DENSENET-169 (architecture of the "DenseNet169" ensemble family)
 # ============================================================================
 
 class _DenseLayer(nn.Module):
-    """Dense layer implementation following original DenseNet paper."""
+    """One DenseNet-BC layer: BN-ReLU-Conv1x1 bottleneck, then BN-ReLU-Conv3x3.
+
+    Each layer receives the concatenation of all previous feature maps in its
+    dense block and produces ``growth_rate`` new feature maps, following
+    Huang et al. (2017), "Densely Connected Convolutional Networks".
+
+    Parameters
+    ----------
+    num_input_features : int
+        Number of channels in the concatenated input feature maps.
+    growth_rate : int
+        Number of feature maps this layer adds (k in the paper).
+    bn_size : int
+        Bottleneck width multiplier: the 1x1 convolution outputs
+        ``bn_size * growth_rate`` channels.
+    drop_rate : float
+        Dropout probability applied to the new feature maps during training.
+        0 disables dropout.
+    """
 
     def __init__(self, num_input_features, growth_rate, bn_size, drop_rate):
         super(_DenseLayer, self).__init__()
@@ -55,7 +75,19 @@ class _DenseLayer(nn.Module):
         self.drop_rate = drop_rate
 
     def bn_function(self, inputs):
-        """Bottleneck function."""
+        """Apply the bottleneck (BN-ReLU-Conv1x1) to the concatenated inputs.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor or list of torch.Tensor
+            A single feature-map tensor, or a list of feature maps that are
+            concatenated along the channel axis first.
+
+        Returns
+        -------
+        torch.Tensor
+            Bottleneck output with ``bn_size * growth_rate`` channels.
+        """
         if isinstance(inputs, torch.Tensor):
             prev_features = [inputs]
         else:
@@ -65,7 +97,18 @@ class _DenseLayer(nn.Module):
         return bottleneck_output
 
     def forward(self, input):
-        """Forward pass."""
+        """Compute this layer's ``growth_rate`` new feature maps.
+
+        Parameters
+        ----------
+        input : torch.Tensor or list of torch.Tensor
+            Feature map(s) from the block input and all preceding layers.
+
+        Returns
+        -------
+        torch.Tensor
+            New feature maps, shape (batch, growth_rate, H, W).
+        """
         if isinstance(input, torch.Tensor):
             prev_features = [input]
         else:
@@ -78,7 +121,25 @@ class _DenseLayer(nn.Module):
 
 
 class _DenseBlock(nn.ModuleDict):
-    """Dense block implementation following original DenseNet paper."""
+    """A DenseNet dense block: ``num_layers`` densely connected layers.
+
+    Every layer sees the block input plus the outputs of all earlier layers,
+    and the block returns all of them concatenated, so the output has
+    ``num_input_features + num_layers * growth_rate`` channels.
+
+    Parameters
+    ----------
+    num_layers : int
+        Number of :class:`_DenseLayer` in the block.
+    num_input_features : int
+        Channels entering the block.
+    bn_size : int
+        Bottleneck width multiplier passed to each layer.
+    growth_rate : int
+        Feature maps added by each layer.
+    drop_rate : float
+        Dropout probability passed to each layer.
+    """
 
     def __init__(self, num_layers, num_input_features, bn_size, growth_rate, drop_rate):
         super(_DenseBlock, self).__init__()
@@ -92,7 +153,18 @@ class _DenseBlock(nn.ModuleDict):
             self.add_module(f'denselayer{i + 1}', layer)
 
     def forward(self, init_features):
-        """Forward pass."""
+        """Run all layers and concatenate their outputs with the input.
+
+        Parameters
+        ----------
+        init_features : torch.Tensor
+            Block input, shape (batch, num_input_features, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch, num_input_features + num_layers * growth_rate, H, W).
+        """
         features = [init_features]
         for name, layer in self.items():
             new_features = layer(features)
@@ -101,7 +173,18 @@ class _DenseBlock(nn.ModuleDict):
 
 
 class _Transition(nn.Sequential):
-    """Transition layer implementation following original DenseNet paper."""
+    """Transition between dense blocks: BN-ReLU-Conv1x1, then 2x2 average pool.
+
+    Reduces the number of channels (DenseNet-BC compression) and halves the
+    spatial size.
+
+    Parameters
+    ----------
+    num_input_features : int
+        Channels entering the transition.
+    num_output_features : int
+        Channels after the 1x1 convolution.
+    """
 
     def __init__(self, num_input_features, num_output_features):
         super(_Transition, self).__init__()
@@ -113,7 +196,36 @@ class _Transition(nn.Sequential):
 
 
 class DenseNet(nn.Module):
-    """DenseNet-BC model implementation."""
+    """DenseNet-BC classifier returning a real/bogus probability.
+
+    Stem (7x7 conv, stride 2, then 3x3 max-pool), dense blocks separated by
+    transitions that halve the channel count, final batch norm, global average
+    pooling, and a linear layer followed by a sigmoid.
+
+    The parameter layout matches the checkpoints of the "DenseNet169" family in
+    the Hugging Face ensemble, so their ``model_state_dict`` loads directly.
+
+    Parameters
+    ----------
+    growth_rate : int
+        Feature maps added by each dense layer.
+    block_config : tuple of int
+        Number of layers in each dense block.
+    num_init_features : int
+        Channels produced by the stem convolution.
+    bn_size : int
+        Bottleneck width multiplier.
+    drop_rate : float
+        Dropout probability inside dense layers.
+    num_classes : int
+        Number of outputs. The ensemble uses 1 (probability of "real").
+
+    Notes
+    -----
+    Input is a 3-channel image tensor of shape (batch, 3, H, W); the classifier
+    feeds the same single-channel cutout in all 3 channels (see
+    :func:`to_model_input`).
+    """
 
     def __init__(self, growth_rate=32, block_config=(6, 12, 24, 16),
                  num_init_features=64, bn_size=4, drop_rate=0, num_classes=1):
@@ -163,7 +275,20 @@ class DenseNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        """Forward pass."""
+        """Probability that each input cutout is a real transient.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (batch, 3, H, W), values in [0, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Sigmoid output in [0, 1]. ``squeeze()`` removes all size-1
+            dimensions, so a batch of one gives a 0-d tensor and a batch of N
+            gives shape (N,).
+        """
         features = self.features(x)
         out = F.relu(features, inplace=True)
         out = F.adaptive_avg_pool2d(out, (1, 1))
@@ -173,68 +298,58 @@ class DenseNet(nn.Module):
 
 
 def densenet169(**kwargs):
-    """DenseNet-169 model."""
+    """Build a DenseNet-169 (growth rate 32, blocks of 6, 12, 32, 32 layers).
+
+    Parameters
+    ----------
+    **kwargs
+        Passed to :class:`DenseNet`, e.g. ``num_classes=1``.
+
+    Returns
+    -------
+    DenseNet
+        Randomly initialised model; load trained weights with
+        ``load_state_dict``.
+    """
     return DenseNet(growth_rate=32, block_config=(6, 12, 32, 32), **kwargs)
 
 
 # ============================================================================
-# CUTOUT GENERATION FUNCTIONS (from make_cutouts.py)
+# CATALOG HANDLING
 # ============================================================================
-
-def normalize_cutout_0_1(cutout_data):
-    """Normalize cutout to 0-1 range."""
-    valid_mask = np.isfinite(cutout_data)
-    if not np.any(valid_mask):
-        return np.zeros_like(cutout_data)
-
-    data_min = np.min(cutout_data[valid_mask])
-    data_max = np.max(cutout_data[valid_mask])
-
-    if data_max == data_min:
-        return np.zeros_like(cutout_data)
-
-    normalized = (cutout_data - data_min) / (data_max - data_min)
-    normalized[~valid_mask] = 0
-    return normalized
-
-
-def extract_cutout_with_padding(image_data, center_x, center_y, cutout_size=64, pad_value=0):
-    """Extract cutout with padding if it goes beyond image boundaries."""
-    half_size = cutout_size // 2
-
-    # Calculate desired bounds
-    y_start = center_y - half_size
-    y_end = center_y + half_size
-    x_start = center_x - half_size
-    x_end = center_x + half_size
-
-    # Calculate actual bounds (clipped to image)
-    y_start_img = max(0, y_start)
-    y_end_img = min(image_data.shape[0], y_end)
-    x_start_img = max(0, x_start)
-    x_end_img = min(image_data.shape[1], x_end)
-
-    # Create padded cutout
-    cutout = np.full((cutout_size, cutout_size), pad_value, dtype=image_data.dtype)
-
-    # Calculate where to place the extracted data in the cutout
-    y_start_cut = y_start_img - y_start
-    y_end_cut = y_start_cut + (y_end_img - y_start_img)
-    x_start_cut = x_start_img - x_start
-    x_end_cut = x_start_cut + (x_end_img - x_start_img)
-
-    # Extract and place data
-    cutout[y_start_cut:y_end_cut, x_start_cut:x_end_cut] = \
-        image_data[y_start_img:y_end_img, x_start_img:x_end_img]
-
-    return cutout
 
 
 def detect_catalog_type(data):
-    """Detect which type of catalog this is based on column names.
+    """Work out which columns of a detection catalog hold the positions.
 
-    For cleaned_score_detection files with columns like:
-    id, x_peak, y_peak, peak_value, x_centroid, y_centroid, ra, dec
+    Two catalog layouts are supported, checked in this order:
+
+    * sidecar score-image detection catalogs (``score_detection_*.ecsv`` and
+      ``cleaned_score_detection_*.ecsv``), with columns such as ``id, x_peak,
+      y_peak, peak_value, x_centroid, y_centroid, ra, dec``. Positions are
+      taken from ``x_centroid``/``y_centroid`` (0-indexed, sub-pixel).
+    * Source Extractor catalogs, with ``X_IMAGE``/``Y_IMAGE`` (1-indexed).
+
+    Parameters
+    ----------
+    data : astropy.table.Table
+        The detection catalog.
+
+    Returns
+    -------
+    catalog_type : str
+        ``"score"`` for x_centroid/y_centroid catalogs, ``"detection"`` for
+        Source Extractor catalogs.
+    x_col, y_col : str
+        Names of the x and y position columns.
+    id_col : str
+        Name of the identifier column: ``"id"`` or ``"NUMBER"``, whichever the
+        catalog type prefers. It is not checked to exist.
+
+    Raises
+    ------
+    ValueError
+        If the catalog has neither pair of position columns.
     """
     colnames = data.colnames
 
@@ -252,329 +367,14 @@ def detect_catalog_type(data):
         raise ValueError(f"Unknown catalog type. Columns: {colnames}")
 
 
-def determine_fits_basename(folder_name):
-    """Determine the corresponding FITS filename from folder name.
-
-    Example: folder_name = 'R062_56618_18_-_R062_2344_8'
-             returns 'decorr_diff_R062_56618_18_-_R062_2344_8'
-    """
-    return f'decorr_diff_{folder_name}'
-
-
-# ============================================================================
-# PREDICTION FUNCTIONS
-# ============================================================================
-
-def predict_cutout(model, cutout_normalized, device, threshold=0.5):
-    """Make prediction on a single cutout."""
-    # Convert to tensor and replicate to 3 channels
-    image_tensor = torch.from_numpy(cutout_normalized).float()
-    image_tensor = image_tensor.unsqueeze(0).repeat(3, 1, 1)
-
-    model.eval()
-    with torch.no_grad():
-        image_tensor = image_tensor.unsqueeze(0).to(device)  # Add batch dimension
-        output = model(image_tensor)
-        probability = output.cpu().numpy().item()
-        prediction = 1 if probability >= threshold else 0
-        return prediction, probability
-
-
-def process_single_catalog(catalog_path, fits_path, output_path,
-                            model_path='DenseNet169_best.pth',
-                            cutout_size=64, threshold=0.5):
-    """Process a single ECSV catalog file with CNN predictions.
-
-    Parameters
-    ----------
-    catalog_path : str or Path
-        Path to the input ECSV catalog file
-    fits_path : str or Path
-        Path to the corresponding FITS difference image
-    output_path : str or Path
-        Path where the output ECSV with predictions should be saved
-    model_path : str
-        Path to the trained model file
-    cutout_size : int
-        Size of cutouts to extract
-    threshold : float
-        Decision threshold for classification
-    """
-    device = torch.device('cpu')
-
-    # Load model
-    model = densenet169(num_classes=1)
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-
-    # Load catalog
-    data = ascii.read(str(catalog_path), format='ecsv')
-    catalog_type, x_col, y_col, id_col = detect_catalog_type(data)
-
-    # Load FITS image
-    with fits.open(fits_path) as hdul:
-        image_data = hdul[0].data
-        if image_data.ndim > 2:
-            image_data = image_data[0] if image_data.ndim == 3 else image_data.squeeze()
-
-    # Process each object
-    predictions = []
-    probabilities = []
-    half_size = cutout_size // 2
-
-    for idx in range(len(data)):
-        row = data[idx]
-        try:
-            x_image = float(row[x_col])
-            y_image = float(row[y_col])
-
-            if x_col in ['X_IMAGE', 'Y_IMAGE']:
-                x_center = int(x_image - 1)
-                y_center = int(y_image - 1)
-            else:
-                x_center = int(x_image)
-                y_center = int(y_image)
-
-            if (x_center < -half_size or x_center >= image_data.shape[1] + half_size or
-                    y_center < -half_size or y_center >= image_data.shape[0] + half_size):
-                predictions.append(-1)
-                probabilities.append(np.nan)
-                continue
-
-            cutout_raw = extract_cutout_with_padding(
-                image_data, x_center, y_center, cutout_size, pad_value=0
-            )
-
-            if np.all(cutout_raw == 0):
-                predictions.append(-1)
-                probabilities.append(np.nan)
-                continue
-
-            cutout_normalized = normalize_cutout_0_1(cutout_raw)
-            prediction, probability = predict_cutout(model, cutout_normalized,
-                                                     device, threshold)
-            predictions.append(prediction)
-            probabilities.append(probability)
-
-        except Exception:
-            predictions.append(-1)
-            probabilities.append(np.nan)
-
-    # Add predictions to catalog
-    data['cnn_prediction'] = predictions
-    data['cnn_probability'] = probabilities
-    data.meta['cnn_threshold'] = threshold
-    data.meta['cnn_model'] = model_path
-    data.meta['cnn_cutout_size'] = cutout_size
-
-    # Save
-    ascii.write(data, output_path, format='ecsv', overwrite=True)
-
-
-def process_ecsv_with_predictions(dia_out_dir='../dia_out_dir',
-                                   model_path='DenseNet169_best.pth',
-                                   cutout_size=64,
-                                   threshold=0.5,
-                                   allow_edge_cutouts=True):
-    """Process ECSV files, make predictions on-the-fly, and save updated catalogs."""
-
-    # Device configuration - force CPU only
-    device = torch.device('cpu')
-    print(f"Using device: {device}")
-    print(f"Decision threshold: {threshold}")
-
-    # Load model
-    print(f"Loading model from {model_path}")
-    model = densenet169(num_classes=1)
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    print("Model loaded successfully\n")
-
-    dia_out_path = Path(dia_out_dir)
-
-    if not dia_out_path.exists():
-        print(f"Directory not found: {dia_out_dir}")
-        return
-
-    # Find all subdirectories
-    subdirs = [d for d in dia_out_path.iterdir() if d.is_dir()]
-
-    if not subdirs:
-        print(f"No subdirectories found in {dia_out_dir}")
-        return
-
-    print("=" * 70)
-    print(f"Found {len(subdirs)} subdirectories")
-    print("=" * 70)
-
-    total_processed = 0
-    total_skipped = 0
-
-    for subdir_idx, subdir in enumerate(subdirs, 1):
-        print(f"\n{'='*70}")
-        print(f"[{subdir_idx}/{len(subdirs)}] {subdir.name}")
-        print(f"{'='*70}")
-
-        # Look for cleaned_score_detection_<folder_name>.ecsv in the subdirectory
-        folder_name = subdir.name
-        ecsv_file = subdir / f'cleaned_score_detection_{folder_name}.ecsv'
-
-        if not ecsv_file.exists():
-            print(f"ECSV file not found: {ecsv_file.name}")
-            continue
-
-        print(f"Found ECSV file: {ecsv_file.name}")
-
-        try:
-            data = ascii.read(str(ecsv_file), format='ecsv')
-            print(f"Loaded ECSV with {len(data):,} objects")
-
-            # Detect catalog type
-            catalog_type, x_col, y_col, id_col = detect_catalog_type(data)
-            print(f"Detected catalog type: '{catalog_type}'")
-            print(f"Using columns: X={x_col}, Y={y_col}, ID={id_col}")
-
-            # Show sample of data
-            print("  Sample data:")
-            for i in range(min(3, len(data))):
-                obj_id = data[i][id_col] if id_col in data.colnames else i
-                print(f"    Object {obj_id}: {x_col}={data[i][x_col]:.2f}, {y_col}={data[i][y_col]:.2f}")
-
-        except Exception:
-            print("Error reading ECSV")
-            continue
-
-        # Determine FITS filename from folder name
-        fits_basename = determine_fits_basename(folder_name)
-        fits_file = subdir / f"{fits_basename}.fits"
-
-        if not fits_file.exists():
-            print(f"FITS file not found: {fits_file.name}")
-            continue
-
-        # Load FITS image
-        try:
-            with fits.open(fits_file) as hdul:
-                image_data = hdul[0].data
-                if image_data.ndim > 2:
-                    image_data = image_data[0] if image_data.ndim == 3 else image_data.squeeze()
-                print(f"Loaded FITS: {fits_file.name} (shape: {image_data.shape})")
-        except Exception:
-            print("Error reading FITS")
-            continue
-
-        # Initialize prediction columns
-        predictions = []
-        probabilities = []
-        successful = 0
-        skipped = 0
-
-        half_size = cutout_size // 2
-
-        print(f"Processing {len(data):,} objects...")
-        for idx in tqdm(range(len(data)), desc="Making predictions", ncols=100):
-            row = data[idx]
-
-            try:
-                # Extract coordinates
-                x_image = float(row[x_col])
-                y_image = float(row[y_col])
-
-                # Convert to 0-indexed
-                if x_col in ['X_IMAGE', 'Y_IMAGE']:
-                    x_center = int(x_image - 1)
-                    y_center = int(y_image - 1)
-                else:
-                    # Centroids are typically already 0-indexed
-                    x_center = int(x_image)
-                    y_center = int(y_image)
-
-                # Check if completely outside image
-                if (x_center < -half_size or x_center >= image_data.shape[1] + half_size or
-                        y_center < -half_size or y_center >= image_data.shape[0] + half_size):
-                    predictions.append(-1)
-                    probabilities.append(np.nan)
-                    skipped += 1
-                    continue
-
-                # Extract cutout with padding
-                cutout_raw = extract_cutout_with_padding(
-                    image_data, x_center, y_center, cutout_size, pad_value=0
-                )
-
-                # Skip if cutout is all padding
-                if np.all(cutout_raw == 0):
-                    predictions.append(-1)
-                    probabilities.append(np.nan)
-                    skipped += 1
-                    continue
-
-                # Normalize cutout
-                cutout_normalized = normalize_cutout_0_1(cutout_raw)
-
-                # Make prediction
-                prediction, probability = predict_cutout(model, cutout_normalized,
-                                                         device, threshold)
-
-                predictions.append(prediction)
-                probabilities.append(probability)
-                successful += 1
-
-            except Exception:
-                predictions.append(-1)
-                probabilities.append(np.nan)
-                skipped += 1
-                continue
-
-        # Add prediction columns to catalog
-        data['real'] = predictions
-        data['real_probability'] = probabilities
-
-        # Add metadata about the threshold used
-        data.meta['cnn_threshold'] = threshold
-        data.meta['cnn_model'] = model_path
-        data.meta['cnn_cutout_size'] = cutout_size
-
-        # Save updated catalog
-        output_file = subdir / f"cleaned_score_detection_{folder_name}_with_predictions.ecsv"
-        ascii.write(data, output_file, format='ecsv', overwrite=True)
-
-        print(f"\n{'─'*70}")
-        print(f"Summary for {folder_name}:")
-        print(f"Successful predictions: {successful:,}")
-        print(f"Skipped (edge/invalid): {skipped:,}")
-        print(f"Positive detections: {sum(p == 1 for p in predictions):,}")
-        print(f"Negative detections: {sum(p == 0 for p in predictions):,}")
-        print(f"Saved to: {output_file.name}")
-        print(f"{'─'*70}")
-
-        total_processed += successful
-        total_skipped += skipped
-
-        del image_data
-
-    print(f"\n{'='*70}")
-    print("COMPLETE")
-    print(f"{'='*70}")
-    print(f"Total predictions: {total_processed:,}")
-    print(f"Total skipped: {total_skipped:,}")
-    print(f"{'='*70}")
-
-
 # ============================================================================
 # ENSEMBLE (Roman-Supernova-PIT/transient-real-bogus on Hugging Face)
 # 6 architecture families x 4 members = 24 models.
 #
 # IMPORTANT: this ensemble was trained with sub-pixel bilinear cutouts and a
 # DOUBLE z-scale normalization (full image, then cutout again) -- see
-# normalize_with_zscale/create_cutout below. Do NOT swap these for
-# normalize_cutout_0_1/extract_cutout_with_padding above; those use plain
-# min-max on an integer-pixel cutout, which is a different convention the
-# ensemble was not trained on and will silently degrade predictions.
+# normalize_with_zscale/create_cutout below. Changing either convention
+# will silently degrade predictions.
 # ============================================================================
 
 REPO_ID = "Roman-Supernova-PIT/transient-real-bogus"
@@ -589,69 +389,135 @@ TIMM_NAMES = {
 
 
 def normalize_with_zscale(data):
-    """ZScale then min-max to [0, 1]. Matches training_script.py exactly."""
+    """Rescale an image to [0, 1] using IRAF-style z-scale limits.
+
+    The display limits (vmin, vmax) are computed with astropy's
+    ``ZScaleInterval`` (default settings: 1000 samples, contrast 0.25) from
+    the finite pixels only. Pixels are then mapped linearly so that vmin -> 0
+    and vmax -> 1, and clipped to [0, 1]. Z-scale ignores the extreme tails,
+    so bright sources saturate at 1 instead of compressing the background.
+
+    This is the normalization used to train the ensemble; it is applied twice,
+    once to the full difference image and once to each cutout (see
+    :func:`make_model_cutout`).
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Image of any shape. May contain NaN or inf.
+
+    Returns
+    -------
+    numpy.ndarray
+        Same shape as ``data``, float32, values in [0, 1]. NaN/inf pixels are
+        set to 0. If vmax <= vmin (e.g. a constant image) every pixel is 0.
+        If no pixel is finite, an all-zero array with ``data``'s dtype is
+        returned.
+    """
     from astropy.visualization import ZScaleInterval
 
     valid_mask = np.isfinite(data)
     if not np.any(valid_mask):
         return np.zeros_like(data)
-    zscale = ZScaleInterval()
-    try:
-        vmin, vmax = zscale.get_limits(data[valid_mask])
-        if vmax > vmin:
-            normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
-        else:
-            normalized = np.zeros_like(data)
-        normalized[~valid_mask] = 0
-    except Exception:
-        if data.max() > data.min():
-            normalized = (data - data.min()) / (data.max() - data.min())
-        else:
-            normalized = np.zeros_like(data)
+    # Empty / all-NaN input is handled above, and ZScaleInterval.get_limits
+    # does not raise on non-empty finite data, so no exception handling here.
+    vmin, vmax = ZScaleInterval().get_limits(data[valid_mask])
+    if vmax > vmin:
+        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+    else:
+        normalized = np.zeros_like(data)
+    normalized[~valid_mask] = 0
     return normalized.astype(np.float32)
 
 
 def create_cutout(data, center_y, center_x, cutout_size=64):
-    """Square cutout centered at (center_y, center_x), sub-pixel-aware
-    (bilinear interpolation), zero-padded at edges."""
+    """Extract a square cutout centred on a (possibly sub-pixel) position.
+
+    Cutout pixel (i, j) samples the image at
+    ``(center_y - cutout_size // 2 + i, center_x - cutout_size // 2 + j)``,
+    so for even ``cutout_size`` the centre falls on pixel
+    ``(cutout_size // 2, cutout_size // 2)``. Values between pixel centres are
+    bilinearly interpolated with ``scipy.interpolate.RegularGridInterpolator``;
+    for integer centres this reduces to a plain slice of the image.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        2D image, indexed ``data[y, x]``.
+    center_y, center_x : float
+        Cutout centre in 0-indexed pixel coordinates.
+    cutout_size : int, optional
+        Side length of the cutout in pixels. Default 64, the size the ensemble
+        was trained on.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape (cutout_size, cutout_size), same dtype as ``data``. Positions
+        outside the image (beyond the outermost pixel centres) are 0, so
+        cutouts near the edge are zero-padded.
+
+    Raises
+    ------
+    ValueError
+        If no sample position of the cutout falls on the image, i.e. the
+        cutout would be entirely padding. The check uses the same sample grid
+        as the interpolation, so a cutout is rejected exactly when it would
+        contain no image pixels.
+    """
     half_size = cutout_size // 2
-    y_start = center_y - half_size
-    x_start = center_x - half_size
-    y_coords = np.arange(cutout_size) + y_start
-    x_coords = np.arange(cutout_size) + x_start
+    y_coords = np.arange(cutout_size) + center_y - half_size
+    x_coords = np.arange(cutout_size) + center_x - half_size
 
-    cutout = np.zeros((cutout_size, cutout_size), dtype=data.dtype)
-    max_y, max_x = data.shape[0] - 1, data.shape[1] - 1
+    ny, nx = data.shape
+    if (y_coords[-1] < 0 or y_coords[0] > ny - 1 or
+            x_coords[-1] < 0 or x_coords[0] > nx - 1):
+        raise ValueError(f"cutout centred at (y={center_y}, x={center_x}) does not overlap "
+                         f"the {ny}x{nx} image")
 
-    for i in range(cutout_size):
-        for j in range(cutout_size):
-            y_pos, x_pos = y_coords[i], x_coords[j]
-            if 0 <= y_pos <= max_y - 1 and 0 <= x_pos <= max_x - 1:
-                y_floor, x_floor = int(np.floor(y_pos)), int(np.floor(x_pos))
-                y_ceil, x_ceil = min(max_y, y_floor + 1), min(max_x, x_floor + 1)
-                y_floor, x_floor = max(0, min(max_y, y_floor)), max(0, min(max_x, x_floor))
-                dy, dx = y_pos - y_floor, x_pos - x_floor
-                try:
-                    cutout[i, j] = (data[y_floor, x_floor] * (1 - dy) * (1 - dx) +
-                                     data[y_ceil, x_floor] * dy * (1 - dx) +
-                                     data[y_floor, x_ceil] * (1 - dy) * dx +
-                                     data[y_ceil, x_ceil] * dy * dx)
-                except IndexError:
-                    safe_y = max(0, min(max_y, int(round(y_pos))))
-                    safe_x = max(0, min(max_x, int(round(x_pos))))
-                    cutout[i, j] = data[safe_y, safe_x]
-            elif 0 <= y_pos <= max_y and 0 <= x_pos <= max_x:
-                safe_y = max(0, min(max_y, int(round(y_pos))))
-                safe_x = max(0, min(max_x, int(round(x_pos))))
-                cutout[i, j] = data[safe_y, safe_x]
-
-    return cutout
+    interpolator = RegularGridInterpolator(
+        (np.arange(data.shape[0]), np.arange(data.shape[1])),
+        data,
+        method="linear",
+        bounds_error=False,
+        fill_value=0,
+    )
+    yy, xx = np.meshgrid(y_coords, x_coords, indexing="ij")
+    return interpolator((yy, xx)).astype(data.dtype)
 
 
 def load_fits_2d_ensemble(fits_path):
-    """Read a 2D image from a FITS file, preferring the DATA/SCI extension
-    (decorr_diff_*.fits keeps the image there, not in PRIMARY -- hdul[0].data
-    is None for these files, unlike the plain hdul[0].data reads above)."""
+    """Read the 2D image from a FITS file as float64, with NaN/inf set to 0.
+
+    Unlike reading ``hdul[0].data`` directly, this also handles sidecar's
+    multi-extension products: ``decorr_diff_*.fits`` has an empty primary HDU
+    and keeps the image in a ``DATA`` extension (followed by ``NOISE``,
+    ``FLAGS`` and ``MASK``).
+
+    The image is taken from, in order of preference:
+
+    1. the ``DATA`` extension, if present;
+    2. otherwise the ``SCI`` extension, if present;
+    3. otherwise the first HDU whose data is not None.
+
+    Parameters
+    ----------
+    fits_path : str or Path
+        Path to the FITS file.
+
+    Returns
+    -------
+    numpy.ndarray
+        2D float64 image. A 3D cube is reduced to its first plane; arrays with
+        more dimensions are squeezed. NaN and +/-inf pixels are replaced by 0.
+
+    Raises
+    ------
+    ValueError
+        If no HDU in the file contains data.
+    OSError
+        If the file cannot be opened or is not valid FITS (raised by astropy).
+    """
     with fits.open(fits_path) as hdul:
         data = None
         for ext_name in ("DATA", "SCI"):
@@ -672,10 +538,50 @@ def load_fits_2d_ensemble(fits_path):
 
 
 def to_model_input(cutout_2d):
+    """Turn a single-channel cutout into the 3-channel tensor the models expect.
+
+    The models are standard image architectures with a 3-channel (RGB) input
+    layer; the ensemble was trained with the same cutout repeated in all three
+    channels.
+
+    Parameters
+    ----------
+    cutout_2d : numpy.ndarray
+        2D cutout of shape (H, W), already normalized to [0, 1].
+
+    Returns
+    -------
+    torch.Tensor
+        float32 tensor of shape (3, H, W). Add a batch dimension with
+        ``.unsqueeze(0)`` before passing it to a model.
+    """
     return torch.from_numpy(cutout_2d).float().unsqueeze(0).repeat(3, 1, 1)
 
 
 class TimmClassifier(nn.Module):
+    """A timm CNN backbone with the ensemble's small classification head.
+
+    Used for the ResNeXt50, RegNetY016, EfficientNetB0 and ConvNeXtTiny
+    families (timm names in ``TIMM_NAMES``). The backbone is created without
+    its own classifier and with global average pooling, then followed by
+    Linear(num_features, 256) - ReLU - Dropout - Linear(256, num_classes) and a
+    sigmoid. The layer names match the Hugging Face checkpoints.
+
+    Parameters
+    ----------
+    model_name : str
+        timm model name, e.g. ``"resnext50_32x4d"``.
+    num_classes : int, optional
+        Number of outputs. The ensemble uses 1 (probability of "real").
+    dropout : float, optional
+        Dropout probability in the head (only active in training mode).
+
+    Notes
+    -----
+    ``pretrained=False``: no ImageNet weights are downloaded; the trained
+    weights are loaded afterwards from the ensemble checkpoint.
+    """
+
     def __init__(self, model_name, num_classes=1, dropout=0.3):
         super().__init__()
         import timm
@@ -686,10 +592,40 @@ class TimmClassifier(nn.Module):
             nn.Linear(nf, 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, num_classes))
 
     def forward(self, x):
+        """Probability that each input cutout is a real transient.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (batch, 3, H, W), values in [0, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch,) for ``num_classes=1``, values in [0, 1].
+        """
         return torch.sigmoid(self.classifier(self.backbone(x))).squeeze(1)
 
 
 class DeiTClassifier(nn.Module):
+    """DeiT-Tiny vision transformer with the ensemble's classification head.
+
+    Used for the DeiTTiny family. The transformer is built for 64x64 inputs
+    (``img_size=64``), i.e. a 4x4 grid of 16x16-pixel patches, so it only
+    accepts 64x64 cutouts. The head is the same as in
+    :class:`TimmClassifier` with dropout 0.3.
+
+    Parameters
+    ----------
+    num_classes : int, optional
+        Number of outputs. The ensemble uses 1 (probability of "real").
+
+    Notes
+    -----
+    ``pretrained=False``: the trained weights are loaded afterwards from the
+    ensemble checkpoint.
+    """
+
     def __init__(self, num_classes=1):
         super().__init__()
         import timm
@@ -700,10 +636,41 @@ class DeiTClassifier(nn.Module):
             nn.Linear(nf, 256), nn.ReLU(), nn.Dropout(0.3), nn.Linear(256, num_classes))
 
     def forward(self, x):
+        """Probability that each input cutout is a real transient.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (batch, 3, 64, 64), values in [0, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch,) for ``num_classes=1``, values in [0, 1].
+        """
         return torch.sigmoid(self.classifier(self.deit(x))).squeeze(1)
 
 
 def build_ensemble_model(family):
+    """Create an untrained model with the architecture of one ensemble family.
+
+    Parameters
+    ----------
+    family : str
+        One of ``ALL_FAMILIES``: ``"DenseNet169"``, ``"ResNeXt50"``,
+        ``"RegNetY016"``, ``"EfficientNetB0"``, ``"ConvNeXtTiny"`` or
+        ``"DeiTTiny"``.
+
+    Returns
+    -------
+    torch.nn.Module
+        Randomly initialised model in training mode, with one output.
+
+    Raises
+    ------
+    KeyError
+        If ``family`` is not a known family name.
+    """
     if family == "DenseNet169":
         return densenet169(num_classes=1)  # reuses this file's existing DenseNet
     if family == "DeiTTiny":
@@ -712,10 +679,54 @@ def build_ensemble_model(family):
 
 
 def family_is_cached(model_dir, family):
+    """Check whether all 4 checkpoints of a family are already on disk.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model cache directory.
+    family : str
+        Family name, e.g. ``"DenseNet169"``.
+
+    Returns
+    -------
+    bool
+        True if exactly 4 files match
+        ``<model_dir>/<family>/<family>_Ensemble_Model*_best.pth``.
+    """
     return len(glob.glob(os.path.join(model_dir, family, f"{family}_Ensemble_Model*_best.pth"))) == 4
 
 
 def ensure_models_downloaded(model_dir, families):
+    """Download any missing ensemble families from Hugging Face.
+
+    Families that are already complete in ``model_dir`` (see
+    :func:`family_is_cached`) are not downloaded again. For the missing ones,
+    their ``*.pth`` checkpoints and README files (plus the repository README)
+    are fetched from ``REPO_ID`` into ``model_dir`` with
+    ``huggingface_hub.snapshot_download``.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local cache directory. Created if it does not exist.
+    families : list of str
+        Families that are needed.
+
+    Returns
+    -------
+    str or Path
+        Directory containing the models: ``model_dir`` itself if nothing had
+        to be downloaded, otherwise the path returned by ``snapshot_download``
+        (the same location).
+
+    Notes
+    -----
+    Needs network access the first time each family is used, and Hugging Face
+    credentials that can read ``REPO_ID`` (e.g. via ``hf auth login`` or the
+    ``HF_TOKEN`` environment variable), since the repository is not publicly
+    readable.
+    """
     missing = [fam for fam in families if not family_is_cached(model_dir, fam)]
     if not missing:
         return model_dir
@@ -725,8 +736,34 @@ def ensure_models_downloaded(model_dir, families):
 
 
 def load_ensemble(model_dir, families, device):
-    """Download (if needed) + load every requested family.
-    Returns dict {family_name: [models]}."""
+    """Load the trained models of the requested families, downloading if needed.
+
+    For each family, every checkpoint matching
+    ``<model_dir>/<family>/<family>_Ensemble_Model*_best.pth`` is loaded (in
+    sorted filename order) into a fresh model from
+    :func:`build_ensemble_model`, moved to ``device`` and put in eval mode.
+    Each checkpoint is a dict whose ``"model_state_dict"`` holds the weights.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model cache directory (see :func:`ensure_models_downloaded`).
+    families : list of str
+        Families to load, from ``ALL_FAMILIES``.
+    device : torch.device
+        Device to place the models on.
+
+    Returns
+    -------
+    dict of str to list of torch.nn.Module
+        ``{family: [model, ...]}`` in the order of ``families``. A family with
+        no checkpoint files is left out.
+
+    Raises
+    ------
+    RuntimeError
+        If no model at all could be loaded.
+    """
     model_dir = ensure_models_downloaded(model_dir, families)
     family_models = {}
     for fam in families:
@@ -745,10 +782,32 @@ def load_ensemble(model_dir, families, device):
 
 
 def predict_ensemble(family_models, cutout_2d_normalized, device):
-    """"Ensemble of ensembles": each family's members are averaged into one
-    per-family score, then the final score is the mean of those per-family
-    scores. Returns (per_family_mean: dict, overall_mean: float, overall_std: float).
-    overall_std is the spread across ALL individual model outputs."""
+    """Score one cutout with every model and combine the results.
+
+    The combination is an "ensemble of ensembles": the members of each family
+    are averaged into one per-family score, and the overall score is the
+    unweighted mean of the per-family scores, so every architecture counts
+    equally regardless of how many members it has.
+
+    Parameters
+    ----------
+    family_models : dict of str to list of torch.nn.Module
+        Output of :func:`load_ensemble`.
+    cutout_2d_normalized : numpy.ndarray
+        2D cutout prepared with :func:`make_model_cutout`.
+    device : torch.device
+        Device the models are on.
+
+    Returns
+    -------
+    per_family_mean : dict of str to float
+        Mean probability of "real" for each family.
+    overall_mean : float
+        Mean of the per-family scores, in [0, 1].
+    overall_std : float
+        Standard deviation across all individual model outputs (not across
+        the family means): a measure of how much the models disagree.
+    """
     x = to_model_input(cutout_2d_normalized).unsqueeze(0).to(device)
     per_family_mean = {}
     all_raw = []
@@ -762,102 +821,279 @@ def predict_ensemble(family_models, cutout_2d_normalized, device):
     return per_family_mean, overall_mean, overall_std
 
 
+# ============================================================================
+# PER-DETECTION SCORING
+# ============================================================================
+
+
+def resolve_device(device="auto"):
+    """Turn a device choice into the ``torch.device`` the models will run on.
+
+    Lets the caller force CPU inference even on a machine where a GPU is
+    available (e.g. to leave the GPU free, or to compare results).
+
+    Parameters
+    ----------
+    device : {"auto", "cpu", "cuda"} or None, optional
+        ``"auto"`` (or None): use the GPU if PyTorch can see one, otherwise the
+        CPU. ``"cpu"``: always use the CPU. ``"cuda"``: always use the GPU.
+        Case-insensitive. Default ``"auto"``.
+
+    Returns
+    -------
+    torch.device
+
+    Raises
+    ------
+    ValueError
+        If ``device`` is not one of the accepted values.
+    RuntimeError
+        If ``"cuda"`` is requested but PyTorch cannot see a GPU (for example a
+        CPU-only PyTorch build), rather than silently falling back to the CPU.
+    """
+    choice = "auto" if device is None else str(device).lower()
+    if choice == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("device='cuda' was requested but PyTorch cannot see a GPU")
+        return torch.device("cuda")
+    raise ValueError(f"device must be 'auto', 'cpu' or 'cuda', not {device!r}")
+
+
+def get_cutout_center(row, x_col, y_col):
+    """Read one catalog row's position as a 0-indexed (y, x) pixel position.
+
+    Only reads and converts the coordinates; whether the position is usable
+    for a cutout is decided by :func:`create_cutout`, which builds the cutout
+    grid.
+
+    ``X_IMAGE``/``Y_IMAGE`` (Source Extractor) are 1-indexed and are shifted
+    by -1; any other columns (e.g. ``x_centroid``/``y_centroid``) are taken as
+    already 0-indexed.
+
+    Parameters
+    ----------
+    row : astropy.table.Row
+        One row of the detection catalog.
+    x_col, y_col : str
+        Names of the position columns, from :func:`detect_catalog_type`.
+
+    Returns
+    -------
+    y_center, x_center : float
+        Position in 0-indexed pixel coordinates.
+
+    Raises
+    ------
+    ValueError
+        If a coordinate is non-numeric, masked, NaN or infinite.
+    """
+    try:
+        x_image = float(row[x_col])
+        y_image = float(row[y_col])
+    except TypeError as e:
+        raise ValueError(f"non-numeric coordinates: {e}") from e
+    if not (np.isfinite(x_image) and np.isfinite(y_image)):
+        raise ValueError("non-finite coordinates")
+
+    if x_col in ('X_IMAGE', 'Y_IMAGE'):
+        return y_image - 1.0, x_image - 1.0
+    return y_image, x_image
+
+
+def make_model_cutout(row, x_col, y_col, normalized_image, cutout_size=64):
+    """Make the model-ready cutout for one catalog row.
+
+    This is the single place that turns a catalog row into the input the
+    ensemble sees, so every detection is prepared the same way:
+
+    1. :func:`get_cutout_center` reads the row's position and converts it to
+       0-indexed pixels;
+    2. :func:`create_cutout` takes a sub-pixel bilinear cutout centred there
+       from an image that has already been z-scaled once, rejecting positions
+       whose cutout would not overlap the image;
+    3. :func:`normalize_with_zscale` z-scales the cutout again, so its
+       contrast is set by its own pixels (the double z-scale used in
+       training).
+
+    Parameters
+    ----------
+    row : astropy.table.Row
+        One row of the detection catalog.
+    x_col, y_col : str
+        Names of the position columns, from :func:`detect_catalog_type`.
+    normalized_image : numpy.ndarray
+        Full 2D difference image, already passed through
+        :func:`normalize_with_zscale`.
+    cutout_size : int, optional
+        Cutout side length in pixels. Default 64; must be 64 for the
+        published ensemble.
+
+    Returns
+    -------
+    numpy.ndarray
+        float32 array of shape (cutout_size, cutout_size), values in [0, 1].
+
+    Raises
+    ------
+    ValueError
+        If the row's coordinates are unusable (non-numeric, masked, NaN/inf)
+        or the cutout would contain no image pixels.
+    """
+    y_center, x_center = get_cutout_center(row, x_col, y_col)
+    cutout = create_cutout(normalized_image, y_center, x_center, cutout_size)
+    return normalize_with_zscale(cutout.astype(np.float32))
+
+
+def score_detection(row, x_col, y_col, normalized_image, family_models, device,
+                    threshold=0.5, cutout_size=64):
+    """Compute the real/bogus scores for one catalog row.
+
+    Makes the model-ready cutout (:func:`make_model_cutout`) and scores it
+    (:func:`predict_ensemble`). Rows whose coordinates are unusable, or whose
+    cutout would contain no image pixels, are not scored and are labelled
+    "invalid" instead of raising, so one bad row does not stop a catalog.
+    Errors from the models are not caught.
+
+    Parameters
+    ----------
+    row : astropy.table.Row
+        One row of the detection catalog.
+    x_col, y_col : str
+        Names of the position columns, from :func:`detect_catalog_type`.
+    normalized_image : numpy.ndarray
+        Full 2D difference image, already passed through
+        :func:`normalize_with_zscale`.
+    family_models : dict of str to list of torch.nn.Module
+        Output of :func:`load_ensemble`.
+    device : torch.device
+        Device the models are on.
+    threshold : float, optional
+        A detection is labelled "real" if its ``real_bogus_score`` is
+        >= threshold, otherwise "bogus". Default 0.5.
+    cutout_size : int, optional
+        Cutout side length in pixels. Default 64.
+
+    Returns
+    -------
+    dict
+        One entry per output catalog column, in this order:
+
+        * ``rb_<family>`` (float) for each family in ``family_models``: mean
+          probability of "real" over that family's members;
+        * ``real_bogus_score`` (float): mean of the per-family scores;
+        * ``real_bogus_score_std`` (float): spread across all individual
+          models;
+        * ``prediction`` (str): "real", "bogus", or "invalid" if no cutout
+          could be made for the row, in which case all scores are NaN.
+    """
+    try:
+        cutout = make_model_cutout(row, x_col, y_col, normalized_image, cutout_size)
+    except ValueError:
+        result = {f"rb_{fam}": np.nan for fam in family_models}
+        result.update(real_bogus_score=np.nan, real_bogus_score_std=np.nan, prediction="invalid")
+        return result
+
+    per_family_mean, overall_mean, overall_std = predict_ensemble(family_models, cutout, device)
+
+    result = {f"rb_{fam}": per_family_mean[fam] for fam in family_models}
+    result.update(
+        real_bogus_score=overall_mean,
+        real_bogus_score_std=overall_std,
+        prediction="real" if overall_mean >= threshold else "bogus",
+    )
+    return result
+
+
 def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
                                      model_dir=None, families=None,
-                                     cutout_size=64, threshold=0.5):
-    """Ensemble equivalent of process_single_catalog: makes cutouts on-the-fly
-    (no cutout files saved) and adds real/bogus ensemble predictions to the
-    ECSV catalog, using the 24-model Roman-Supernova-PIT/transient-real-bogus
-    ensemble instead of the single local DenseNet169.
+                                     cutout_size=64, threshold=0.5, device="auto"):
+    """Add real/bogus scores for every detection in a catalog and save it.
+
+    Loads the ensemble (:func:`load_ensemble`, downloading from Hugging Face
+    on first use), reads the catalog and the difference image, z-scales the
+    whole image once, then scores each row with :func:`score_detection`.
+    Cutouts are made in memory; no cutout files are written. The input
+    catalog is not modified; the result is written to ``output_path``.
 
     Parameters
     ----------
     catalog_path : str or Path
-        Path to the input ECSV catalog file
+        Input ECSV detection catalog. Must have ``x_centroid``/``y_centroid``
+        or ``X_IMAGE``/``Y_IMAGE`` columns (see :func:`detect_catalog_type`).
     fits_path : str or Path
-        Path to the corresponding FITS difference image
+        Difference image the detections were measured on, e.g. sidecar's
+        ``decorr_diff_*.fits`` (read with :func:`load_fits_2d_ensemble`).
+        Catalog positions must be in this image's pixel coordinates.
     output_path : str or Path
-        Path where the output ECSV with predictions should be saved
-    model_dir : str or Path
-        Where the ensemble weights live (downloaded from Hugging Face on
-        first use, cached and skipped on later calls). Defaults to
-        ~/roman_sn_pit_models.
-    families : list of str
-        Subset of ALL_FAMILIES to use. Defaults to all 6.
-    cutout_size : int
-        Size of cutouts to extract
-    threshold : float
-        Decision threshold on the overall real_bogus_score
+        Where to write the scored catalog, as Parquet. Overwritten if it exists.
+        Table metadata (threshold, model dir, etc.) is kept in the file.
+    model_dir : str or Path, optional
+        Local cache for the ensemble weights. Default ``~/roman_sn_pit_models``.
+    families : list of str, optional
+        Subset of ``ALL_FAMILIES`` to use. Default: all 6.
+    cutout_size : int, optional
+        Cutout side length in pixels. Default 64; must be 64 for the published
+        ensemble (the DeiT model only accepts 64x64 input).
+    threshold : float, optional
+        A detection is labelled "real" if its ``real_bogus_score`` is
+        >= threshold, otherwise "bogus". Default 0.5.
+    device : {"auto", "cpu", "cuda"}, optional
+        Where to run the models (see :func:`resolve_device`). Default
+        ``"auto"``: the GPU if PyTorch can see one, otherwise the CPU. Use
+        ``"cpu"`` to force CPU inference on a GPU machine.
+
+    Returns
+    -------
+    None
+        The output catalog has all input columns plus, per row (see
+        :func:`score_detection`): ``rb_<family>`` for each loaded family,
+        ``real_bogus_score``, ``real_bogus_score_std`` and ``prediction``.
+        Its metadata records ``real_bogus_threshold``, ``real_bogus_model_dir``,
+        ``real_bogus_n_models`` and ``real_bogus_cutout_size``.
+
+    Raises
+    ------
+    ValueError
+        If the catalog has no recognised position columns, the FITS file has
+        no image data, or ``device`` is not "auto", "cpu" or "cuda".
+    RuntimeError
+        If no models could be loaded, or ``device="cuda"`` but no GPU is
+        available.
     """
     if model_dir is None:
         model_dir = os.path.expanduser("~/roman_sn_pit_models")
     if families is None:
         families = ALL_FAMILIES
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(device)
     family_models = load_ensemble(model_dir, families, device)
-    families_order = [f for f in families if f in family_models]
     total_models = sum(len(v) for v in family_models.values())
 
     data = ascii.read(str(catalog_path), format='ecsv')
     catalog_type, x_col, y_col, id_col = detect_catalog_type(data)
 
     normalized_full = normalize_with_zscale(load_fits_2d_ensemble(fits_path))
-    half_size = cutout_size // 2
 
-    per_family_cols = {fam: [] for fam in families_order}
-    scores, stds, preds = [], [], []
-
-    for idx in tqdm(range(len(data)), desc="Scoring (ensemble)"):
-        row = data[idx]
-        try:
-            x_image = float(row[x_col])
-            y_image = float(row[y_col])
-            if x_col in ('X_IMAGE', 'Y_IMAGE'):
-                x_center, y_center = x_image - 1.0, y_image - 1.0
-            else:
-                x_center, y_center = x_image, y_image
-
-            if (x_center < -half_size or x_center >= normalized_full.shape[1] + half_size or
-                    y_center < -half_size or y_center >= normalized_full.shape[0] + half_size):
-                raise ValueError("center outside image bounds")
-
-            cutout = create_cutout(normalized_full, y_center, x_center, cutout_size)
-            cutout = normalize_with_zscale(cutout.astype(np.float32))
-            per_family_mean, overall_mean, overall_std = predict_ensemble(family_models, cutout, device)
-
-            for fam in families_order:
-                per_family_cols[fam].append(per_family_mean[fam])
-            scores.append(overall_mean)
-            stds.append(overall_std)
-            preds.append("real" if overall_mean >= threshold else "bogus")
-
-        except Exception:
-            for fam in families_order:
-                per_family_cols[fam].append(np.nan)
-            scores.append(np.nan)
-            stds.append(np.nan)
-            preds.append("invalid")
-
-    for fam in families_order:
-        data[f"rb_{fam}"] = per_family_cols[fam]
-    data["real_bogus_score"] = scores
-    data["real_bogus_score_std"] = stds
-    data["prediction"] = preds
+    n_rows = len(data)
+    log_every = max(1, n_rows // 10)
+    SNLogger.info(f"Scoring {n_rows} detections with {total_models} models")
+    results = []
+    for i, row in enumerate(data, start=1):
+        results.append(score_detection(row, x_col, y_col, normalized_full, family_models, device,
+                                       threshold=threshold, cutout_size=cutout_size))
+        if i % log_every == 0 or i == n_rows:
+            SNLogger.info(f"Scored {i}/{n_rows} detections")
+    output_columns = list(results[0]) if results else [f"rb_{fam}" for fam in family_models] + [
+        "real_bogus_score", "real_bogus_score_std", "prediction"]
+    for col in output_columns:
+        data[col] = [r[col] for r in results]
     data.meta["real_bogus_threshold"] = threshold
     data.meta["real_bogus_model_dir"] = str(model_dir)
     data.meta["real_bogus_n_models"] = total_models
     data.meta["real_bogus_cutout_size"] = cutout_size
 
-    ascii.write(data, output_path, format='ecsv', overwrite=True)
-
-
-if __name__ == "__main__":
-    process_ecsv_with_predictions(
-        dia_out_dir='../dia_out_dir',
-        model_path='DenseNet169_best.pth',
-        cutout_size=64,
-        threshold=0.5,
-        allow_edge_cutouts=True
-    )
-    print("\nComplete!")
+    data.write(output_path, format='parquet', overwrite=True)
