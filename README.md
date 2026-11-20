@@ -128,7 +128,17 @@ sidecar/examples/perlmutter/test_sidecar_asdf_manualrdm.sh
 - Detection: Find positive and negative peaks in background-subtracted difference and score images using a
   local background-RMS threshold (5 times the local RMS by default); catalog `peak_value` is background-subtracted.
   Subtraction products store SFFT's blank-region mask in a separate `NO_COVERAGE` FITS extension.
-- Cleaned catalogs are written when known-star rejection is enabled. Cleaned score and simple-difference
+- Cleaned catalogs are written when known-star rejection is enabled. By default, stars with Gaia G
+  magnitude 16.5 or fainter use a 5 arcsec rejection radius; for brighter stars the radius is
+  `min(60, 5 * 10**(0.2 * (16.5 - G)))` arcsec. Nonempty star catalogs must include
+  `phot_g_mean_mag`; stars with missing magnitude values use the base radius.
+  Configure these values with `--star-rejection-match-radius`, `--star-rejection-ref-mag`,
+  `--star-rejection-scale`, and `--star-rejection-max-radius`. Set `--star-rejection-ref-mag none`
+  for a fixed radius or `--star-rejection-max-radius none` for no cap. These options apply to all
+  cleaned catalogs and are separate from the pixel-based bright-star masks used for SFFT source selection.
+  The defaults were tested on one field and can also reject real transients close to stars; validate them
+  for each dataset.
+  Cleaned score and simple-difference
   catalogs also exclude sources with bad or unmeasured pixels in the 3-pixel flag aperture of the science,
   template, or respective subtraction product, each measured at the source's sky position.
   The cleaned score catalog additionally requires `abs(score_aper_r3_snr) >= 7`, configurable with

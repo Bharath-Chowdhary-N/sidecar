@@ -61,6 +61,41 @@ def test_empty():
     assert len(reject_stars(detection[:0], stars, 5.0)) == 0
 
 
+@pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
+def test_pipeline_star_rejection_radius_behavior(tmp_path, output_format):
+    stars = Table({"ra": [10.0, 20.0], "dec": [0.0, 0.0], "phot_g_mean_mag": [15.73, 16.34]})
+    detections = Table(
+        {
+            "id": [0, 1, 2, 3],
+            "ra": [10 + 5.2 / 3600, 10 + 7.3 / 3600, 20 + 5.2 / 3600, 20 + 5.5 / 3600],
+            "dec": [0.0] * 4,
+        }
+    )
+    path = tmp_path / "detections.ecsv"
+    write_catalog(detections, path, output_format="ecsv")
+    options = dict(ref_mag=16.5, scale=0.2, max_radius=60.0)
+    output = tmp_path / f"cleaned.{output_format}"
+    cleaned = Detection.reject_stars(stars, path, 5.0, output, output_format=output_format, **options)
+    assert list(cleaned["id"]) == [1, 3]
+    assert list(read_catalog(output)["id"]) == [1, 3]
+    fixed = Detection.reject_stars(stars, path, 5.0, output, output_format=output_format, ref_mag=None)
+    assert list(fixed["id"]) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"star_rejection_match_radius": -1},
+        {"star_rejection_scale": np.nan},
+        {"star_rejection_ref_mag": np.inf},
+        {"star_rejection_max_radius": 4},
+    ],
+)
+def test_invalid_pipeline_star_rejection_options(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="star_rejection"):
+        Detection(None, [], temp_dir=tmp_path, output_dir=tmp_path, **kwargs)
+
+
 @pytest.mark.parametrize("detection_format", ["ecsv", "parquet"])
 @pytest.mark.parametrize("star_format", ["ecsv", "parquet"])
 @pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
@@ -104,8 +139,9 @@ def test_read_star_catalog_text_compatibility(tmp_path):
     assert len(read_star_catalog(text)) == 1
 
 
-def test_read_star_catalog_parquet(tmp_path):
-    parquet = tmp_path / "stars.PARQUET"
+@pytest.mark.parametrize("suffix", [".parquet", ".PARQUET", ".pq"])
+def test_read_star_catalog_parquet(tmp_path, suffix):
+    parquet = tmp_path / f"stars{suffix}"
     write_catalog(Table({"ra": [10.0], "dec": [0.0], "phot_g_mean_mag": [18.0]}), parquet)
     assert list(read_star_catalog(parquet)["ra"]) == [10.0]
     assert list(read_catalog(parquet)["ra"]) == [10.0]
@@ -360,7 +396,7 @@ def test_center_flag_options_combine(monkeypatch, tmp_path):
         Detection(**kwargs, reject_center_jump_det=True, center_flag_columns=[])
 
 
-@pytest.mark.parametrize("mode", ["default", "custom", "empty"])
+@pytest.mark.parametrize("mode", ["default", "custom", "empty", "fixed"])
 def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
     class TestConfig:
         def value(self, key, default=None):
@@ -401,12 +437,31 @@ def test_pipeline_cli_configures_cleaning_columns(monkeypatch, tmp_path, mode):
             "0.2",
             "--catalog-output-format",
             "ecsv",
+            "--star-rejection-match-radius",
+            "4",
+            "--star-rejection-ref-mag",
+            "18",
+            "--star-rejection-scale",
+            "0.3",
+            "--star-rejection-max-radius",
+            "40",
         ]
     elif mode == "empty":
         args += ["--bad-pixel-columns", "--reject-center-jump-det"]
+    elif mode == "fixed":
+        args += ["--star-rejection-ref-mag", "none", "--star-rejection-max-radius", "none"]
     monkeypatch.setattr(sys, "argv", args)
     pipeline.main()
     (detection,) = results
+    expected_options = {"ref_mag": 16.5, "scale": 0.2, "max_radius": 60.0}
+    expected_radius = 5.0
+    if mode == "custom":
+        expected_options = {"ref_mag": 18.0, "scale": 0.3, "max_radius": 40.0}
+        expected_radius = 4.0
+    elif mode == "fixed":
+        expected_options = {"ref_mag": None, "scale": 0.2, "max_radius": None}
+    assert detection.star_rejection_match_radius == expected_radius
+    assert detection.star_rejection_options == expected_options
     if mode == "custom":
         assert detection.bad_pixel_columns == ["science_flags_npix_bad", "flags_npix_bad"]
         assert detection.center_flag_columns == ["template_flags_center", "flags_center"]
@@ -456,7 +511,14 @@ def test_pipeline_output_paths_follow_format(monkeypatch, tmp_path, output_forma
 
 
 @pytest.mark.parametrize("output_format", ["ecsv", "parquet"])
-def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, output_format):
+@pytest.mark.parametrize(
+    "radius,options",
+    [
+        (5.0, {"ref_mag": 16.5, "scale": 0.2, "max_radius": 60.0}),
+        (4.0, {"ref_mag": 18.0, "scale": 0.3, "max_radius": 40.0}),
+    ],
+)
+def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, output_format, radius, options):
     class TestConfig:
         def value(self, key, default=None):
             if key == "system.ou24.tds_base":
@@ -492,6 +554,14 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
     monkeypatch.setattr(Detection, "path_helper", lambda *args, **kwargs: paths)
     monkeypatch.setattr(Detection, "load_product_image", staticmethod(lambda path: object()))
     monkeypatch.setattr(Detection, "load_no_coverage_mask", staticmethod(lambda path: None))
+    calls = []
+    original_reject_stars = Detection.reject_stars
+
+    def capture_reject_stars(stars, path, match_radius, output_path, **kwargs):
+        calls.append((match_radius, {key: kwargs[key] for key in ("ref_mag", "scale", "max_radius")}))
+        return original_reject_stars(stars, path, match_radius, output_path, **kwargs)
+
+    monkeypatch.setattr(Detection, "reject_stars", staticmethod(capture_reject_stars))
     detections = Table(
         {
             "id": [0, 1, 2],
@@ -536,6 +606,10 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
         bad_pixel_columns=["science_flags_npix_bad", "flags_npix_bad"],
         center_flag_columns=["template_flags_center", "flags_center"],
         output_format=output_format,
+        star_rejection_match_radius=radius,
+        star_rejection_ref_mag=options["ref_mag"],
+        star_rejection_scale=options["scale"],
+        star_rejection_max_radius=options["max_radius"],
     )
     instance.run_one_subtraction(
         SimpleNamespace(get_image=lambda path: object()),
@@ -550,6 +624,7 @@ def test_pipeline_uses_configured_columns_when_cleaning(monkeypatch, tmp_path, o
     assert list(read_catalog(paths["cleaned_score_detection_path"])["id"]) == [0]
     assert list(read_catalog(paths["cleaned_simple_difference_detection_path"])["id"]) == [0]
     assert list(read_catalog(paths["cleaned_difference_detection_path"])["id"]) == [0, 1]
+    assert calls == [(radius, options)] * 3
     instance.reject_single_pixel = False
     instance.run_one_subtraction(
         SimpleNamespace(get_image=lambda path: object()),

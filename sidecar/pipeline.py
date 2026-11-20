@@ -81,6 +81,9 @@ class Detection:
     # Source Matching
     MATCH_RADIUS = 0.4 * u.arcsec
     REJECT_MATCH_RADIUS = 5 * u.arcsec
+    REJECT_REF_MAG = 16.5
+    REJECT_SCALE = 0.2
+    REJECT_MAX_RADIUS = 60.0
 
     # file prefix
     SIMPLE_DIFF_IMAGE_PREFIX = "simple_diff_"
@@ -137,11 +140,26 @@ class Detection:
         single_pixel_min_peak_r3=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
         single_pixel_area_atol=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
         output_format="parquet",
+        star_rejection_match_radius=REJECT_MATCH_RADIUS.to_value(u.arcsec),
+        star_rejection_ref_mag=REJECT_REF_MAG,
+        star_rejection_scale=REJECT_SCALE,
+        star_rejection_max_radius=REJECT_MAX_RADIUS,
     ):
         if output_format not in OUTPUT_FORMATS:
             raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
         if not np.isfinite(cleaned_score_min_snr) or cleaned_score_min_snr < 0:
             raise ValueError("cleaned_score_min_snr must be finite and nonnegative")
+        for name, value in (
+            ("star_rejection_match_radius", star_rejection_match_radius),
+            ("star_rejection_scale", star_rejection_scale),
+        ):
+            if value is None or not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if star_rejection_ref_mag is not None and not np.isfinite(star_rejection_ref_mag):
+            raise ValueError("star_rejection_ref_mag must be finite or None")
+        if star_rejection_max_radius is not None:
+            if not np.isfinite(star_rejection_max_radius) or star_rejection_max_radius < star_rejection_match_radius:
+                raise ValueError("star_rejection_max_radius must be finite and at least star_rejection_match_radius")
         center_dq_flags = _validate_dq_mask(center_dq_flags)
         SNLogger.setLevel(logging.DEBUG if verbose else logging.INFO)
         self.config = Config.get()
@@ -166,6 +184,12 @@ class Detection:
         self.psf_type = psf_type
         self.psf_size = psf_size
         self.reject_known_stars = reject_known_stars
+        self.star_rejection_match_radius = star_rejection_match_radius
+        self.star_rejection_options = {
+            "ref_mag": star_rejection_ref_mag,
+            "scale": star_rejection_scale,
+            "max_radius": star_rejection_max_radius,
+        }
         self.cross_convolve = cross_convolve
         self.assume_subtraction_has_been_run = assume_subtraction_has_been_run
 
@@ -747,7 +771,7 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["simple_difference_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_simple_difference_detection_path"],
                     bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "simple_diff"),
                     center_flag_columns=_product_flag_columns(self.center_flag_columns, "simple_diff"),
@@ -755,6 +779,7 @@ class Detection:
                     single_pixel_product="simple_diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
 
             SNLogger.info("Removing known stars from diffim image detection")
@@ -765,11 +790,12 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["difference_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_difference_detection_path"],
                     single_pixel_product="diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -782,7 +808,7 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["score_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_score_detection_path"],
                     bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "score"),
                     center_flag_columns=_product_flag_columns(self.center_flag_columns, "score"),
@@ -792,6 +818,7 @@ class Detection:
                     single_pixel_product="score" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -1180,6 +1207,30 @@ def main():
         help="Minimum absolute score r=3 aperture S/N in the cleaned score catalog (default %(default)s).",
     )
     parser.add_argument(
+        "--star-rejection-match-radius",
+        type=float,
+        default=Detection.REJECT_MATCH_RADIUS.to_value(u.arcsec),
+        help="Base known-star rejection radius in arcseconds (default %(default)s).",
+    )
+    parser.add_argument(
+        "--star-rejection-ref-mag",
+        type=lambda value: None if value.lower() == "none" else float(value),
+        default=Detection.REJECT_REF_MAG,
+        help="Stars brighter than this Gaia G magnitude get a larger radius (default %(default)s); 'none' disables scaling.",
+    )
+    parser.add_argument(
+        "--star-rejection-scale",
+        type=float,
+        default=Detection.REJECT_SCALE,
+        help="Magnitude exponent for the known-star rejection radius (default %(default)s).",
+    )
+    parser.add_argument(
+        "--star-rejection-max-radius",
+        type=lambda value: None if value.lower() == "none" else float(value),
+        default=Detection.REJECT_MAX_RADIUS,
+        help="Maximum known-star rejection radius in arcseconds (default %(default)s); 'none' removes the cap.",
+    )
+    parser.add_argument(
         "--bad-pixel-columns",
         nargs="*",
         default=None,
@@ -1475,6 +1526,10 @@ def main():
         threshold=args.threshold,
         threshold_column=args.threshold_column,
         cleaned_score_min_snr=args.cleaned_score_min_snr,
+        star_rejection_match_radius=args.star_rejection_match_radius,
+        star_rejection_ref_mag=args.star_rejection_ref_mag,
+        star_rejection_scale=args.star_rejection_scale,
+        star_rejection_max_radius=args.star_rejection_max_radius,
         center_dq_flags=args.center_dq_flags,
         reject_center_jump_det=args.reject_center_jump_det,
         bad_pixel_columns=args.bad_pixel_columns,
