@@ -1,0 +1,1 @@
+Add square pixel grid measurements to look for isolated hot pixel.

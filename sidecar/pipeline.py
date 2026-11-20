@@ -25,7 +25,11 @@ from sidecar.source_detection import (
     DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR,
     DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
     DEFAULT_SINGLE_PIXEL_MIN_R2_R3,
+    DEFAULT_SQUARE_PIXEL_MIN_SNR,
+    DEFAULT_SQUARE_PIXEL_MIN_1_OVER_3,
+    DEFAULT_SQUARE_PIXEL_MIN_3_OVER_5,
     find_single_pixel_suspects,
+    find_square_pixel_suspects,
     detect_and_measure_sources,
 )
 from sidecar import util
@@ -81,6 +85,9 @@ class Detection:
     # Source Matching
     MATCH_RADIUS = 0.4 * u.arcsec
     REJECT_MATCH_RADIUS = 5 * u.arcsec
+    REJECT_REF_MAG = 16.5
+    REJECT_SCALE = 0.2
+    REJECT_MAX_RADIUS = 60.0
 
     # file prefix
     SIMPLE_DIFF_IMAGE_PREFIX = "simple_diff_"
@@ -137,11 +144,35 @@ class Detection:
         single_pixel_min_peak_r3=DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3,
         single_pixel_area_atol=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
         output_format="parquet",
+        star_rejection_match_radius=REJECT_MATCH_RADIUS.to_value(u.arcsec),
+        star_rejection_ref_mag=REJECT_REF_MAG,
+        star_rejection_scale=REJECT_SCALE,
+        star_rejection_max_radius=REJECT_MAX_RADIUS,
+        cleaned_simple_min_snr=None,
+        reject_square_pixel=True,
+        square_pixel_min_snr=DEFAULT_SQUARE_PIXEL_MIN_SNR,
+        square_pixel_min_1_over_3=DEFAULT_SQUARE_PIXEL_MIN_1_OVER_3,
+        square_pixel_min_3_over_5=DEFAULT_SQUARE_PIXEL_MIN_3_OVER_5,
     ):
         if output_format not in OUTPUT_FORMATS:
             raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}")
         if not np.isfinite(cleaned_score_min_snr) or cleaned_score_min_snr < 0:
             raise ValueError("cleaned_score_min_snr must be finite and nonnegative")
+        if cleaned_simple_min_snr is not None and (
+            not np.isfinite(cleaned_simple_min_snr) or cleaned_simple_min_snr < 0
+        ):
+            raise ValueError("cleaned_simple_min_snr must be finite and nonnegative or None")
+        for name, value in (
+            ("star_rejection_match_radius", star_rejection_match_radius),
+            ("star_rejection_scale", star_rejection_scale),
+        ):
+            if value is None or not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if star_rejection_ref_mag is not None and not np.isfinite(star_rejection_ref_mag):
+            raise ValueError("star_rejection_ref_mag must be finite or None")
+        if star_rejection_max_radius is not None:
+            if not np.isfinite(star_rejection_max_radius) or star_rejection_max_radius < star_rejection_match_radius:
+                raise ValueError("star_rejection_max_radius must be finite and at least star_rejection_match_radius")
         center_dq_flags = _validate_dq_mask(center_dq_flags)
         SNLogger.setLevel(logging.DEBUG if verbose else logging.INFO)
         self.config = Config.get()
@@ -166,6 +197,12 @@ class Detection:
         self.psf_type = psf_type
         self.psf_size = psf_size
         self.reject_known_stars = reject_known_stars
+        self.star_rejection_match_radius = star_rejection_match_radius
+        self.star_rejection_options = {
+            "ref_mag": star_rejection_ref_mag,
+            "scale": star_rejection_scale,
+            "max_radius": star_rejection_max_radius,
+        }
         self.cross_convolve = cross_convolve
         self.assume_subtraction_has_been_run = assume_subtraction_has_been_run
 
@@ -174,6 +211,7 @@ class Detection:
         self.threshold = threshold
         self.threshold_column = threshold_column
         self.cleaned_score_min_snr = cleaned_score_min_snr
+        self.cleaned_simple_min_snr = cleaned_simple_min_snr
         self.single_pixel_options = {
             "min_input_snr": single_pixel_min_input_snr,
             "min_r2_r3": single_pixel_min_r2_r3,
@@ -184,6 +222,15 @@ class Detection:
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"single_pixel_{name} must be finite and nonnegative")
         self.reject_single_pixel = reject_single_pixel
+        self.square_pixel_options = {
+            "min_snr": square_pixel_min_snr,
+            "min_1_over_3": square_pixel_min_1_over_3,
+            "min_3_over_5": square_pixel_min_3_over_5,
+        }
+        for name, value in self.square_pixel_options.items():
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"square_pixel_{name} must be finite and nonnegative")
+        self.reject_square_pixel = reject_square_pixel
         self.center_dq_flags = center_dq_flags | (int(dqflags.pixel.JUMP_DET) if reject_center_jump_det else 0)
         self.bad_pixel_columns = (
             ["template_flags_npix_bad", "science_flags_npix_bad", "flags_npix_bad"]
@@ -324,6 +371,8 @@ class Detection:
         single_pixel_product=None,
         single_pixel_options=None,
         output_format="parquet",
+        square_pixel_product=None,
+        square_pixel_options=None,
         **radius_kwargs,
     ):
         """Reject stars from subtraction detection catalogs
@@ -359,6 +408,11 @@ class Detection:
             Rows that cannot be assessed are retained.
         single_pixel_options : dict, optional
             Thresholds passed to `find_single_pixel_suspects`.
+        square_pixel_product : str, optional
+            Product column prefix enabling the experimental square-flux cut.
+            Rows that cannot be assessed are retained.
+        square_pixel_options : dict, optional
+            Thresholds passed to `find_square_pixel_suspects`.
         radius_kwargs :
             ref_mag, scale, max_radius, mag_col for a magnitude-dependent radius; see util.reject_stars
 
@@ -411,6 +465,17 @@ class Detection:
             if np.any(~measurable):
                 SNLogger.warning(
                     f"Keeping {np.count_nonzero(~measurable)} candidates with inconclusive single-pixel measurements"
+                )
+            cleaned_detection = cleaned_detection[~suspects]
+
+        if square_pixel_product is not None:
+            suspects, measurable = find_square_pixel_suspects(
+                cleaned_detection, square_pixel_product, **(square_pixel_options or {})
+            )
+            SNLogger.info(f"Removing {np.count_nonzero(suspects)} square-flux single-pixel candidates")
+            if np.any(~measurable):
+                SNLogger.warning(
+                    f"Keeping {np.count_nonzero(~measurable)} candidates with inconclusive square-flux measurements"
                 )
             cleaned_detection = cleaned_detection[~suspects]
 
@@ -579,13 +644,14 @@ class Detection:
              written to the `*_detection_path` files.
           5. If `reject_known_stars`, write `cleaned_*` catalogs with sources matching known stars removed.
              Also reject bad or unmeasured pixels in simple-difference and score apertures, and apply the
-             absolute score r=3 aperture S/N cut to the cleaned score catalog.
+             configured aperture S/N cuts, and the enabled single-pixel concentration cuts.
           6. If `self.save_candidates_to_database`, save DiaObjects from the (cleaned, if made) score catalog.
 
         Uses instance settings for everything not passed as an argument: `cross_convolve`, `save_debug_products`,
         `detection_kwargs`, `resample_method`, `sfft_kwargs`, `pre_smooth_sigma`, `input_star_catalog_path`,
-        `threshold`, `threshold_column`, `cleaned_score_min_snr`, `center_dq_flags`, `bad_pixel_columns`,
-        `center_flag_columns`, `reject_single_pixel`, `single_pixel_options`, and `save_candidates_to_database`.
+        `threshold`, `threshold_column`, `cleaned_score_min_snr`, `cleaned_simple_min_snr`, `center_dq_flags`,
+        `bad_pixel_columns`, `center_flag_columns`, `reject_single_pixel`, `single_pixel_options`,
+        `reject_square_pixel`, `square_pixel_options`, and `save_candidates_to_database`.
 
         Parameters
         ----------
@@ -747,14 +813,19 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["simple_difference_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_simple_difference_detection_path"],
                     bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "simple_diff"),
                     center_flag_columns=_product_flag_columns(self.center_flag_columns, "simple_diff"),
                     center_dq_flags=self.center_dq_flags,
+                    snr_column="simple_diff_aper_r3_snr" if self.cleaned_simple_min_snr is not None else None,
+                    min_abs_snr=self.cleaned_simple_min_snr,
                     single_pixel_product="simple_diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    square_pixel_product="simple_diff" if self.reject_square_pixel else None,
+                    square_pixel_options=self.square_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
 
             SNLogger.info("Removing known stars from diffim image detection")
@@ -765,11 +836,14 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["difference_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_difference_detection_path"],
                     single_pixel_product="diff" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    square_pixel_product="diff" if self.reject_square_pixel else None,
+                    square_pixel_options=self.square_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -782,7 +856,7 @@ class Detection:
                 _ = self.__class__.reject_stars(
                     stars,
                     file_path["score_detection_path"],
-                    self.REJECT_MATCH_RADIUS,
+                    self.star_rejection_match_radius,
                     file_path["cleaned_score_detection_path"],
                     bad_pixel_column=_product_flag_columns(self.bad_pixel_columns, "score"),
                     center_flag_columns=_product_flag_columns(self.center_flag_columns, "score"),
@@ -791,7 +865,10 @@ class Detection:
                     min_abs_snr=self.cleaned_score_min_snr,
                     single_pixel_product="score" if self.reject_single_pixel else None,
                     single_pixel_options=self.single_pixel_options,
+                    square_pixel_product="score" if self.reject_square_pixel else None,
+                    square_pixel_options=self.square_pixel_options,
                     output_format=self.output_format,
+                    **self.star_rejection_options,
                 )
             except FileNotFoundError:
                 SNLogger.warning(
@@ -1180,6 +1257,37 @@ def main():
         help="Minimum absolute score r=3 aperture S/N in the cleaned score catalog (default %(default)s).",
     )
     parser.add_argument(
+        "--cleaned-simple-min-snr",
+        type=float,
+        default=None,
+        help="Minimum absolute simple-difference r=3 aperture S/N in the cleaned catalog (default: no cut).",
+    )
+    parser.add_argument(
+        "--star-rejection-match-radius",
+        type=float,
+        default=Detection.REJECT_MATCH_RADIUS.to_value(u.arcsec),
+        help="Base known-star rejection radius in arcseconds (default %(default)s).",
+    )
+    parser.add_argument(
+        "--star-rejection-ref-mag",
+        type=lambda value: None if value.lower() == "none" else float(value),
+        default=Detection.REJECT_REF_MAG,
+        help="Stars brighter than this Gaia G magnitude get a larger radius (default %(default)s); "
+        "'none' disables scaling.",
+    )
+    parser.add_argument(
+        "--star-rejection-scale",
+        type=float,
+        default=Detection.REJECT_SCALE,
+        help="Magnitude exponent for the known-star rejection radius (default %(default)s).",
+    )
+    parser.add_argument(
+        "--star-rejection-max-radius",
+        type=lambda value: None if value.lower() == "none" else float(value),
+        default=Detection.REJECT_MAX_RADIUS,
+        help="Maximum known-star rejection radius in arcseconds (default %(default)s); 'none' removes the cap.",
+    )
+    parser.add_argument(
         "--bad-pixel-columns",
         nargs="*",
         default=None,
@@ -1211,7 +1319,7 @@ def main():
         "--reject-single-pixel",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Reject concentrated input-image sources from cleaned catalogs (default on).",
+        help="Reject circular-aperture concentrated input-image sources from cleaned catalogs (default on).",
     )
     parser.add_argument(
         "--single-pixel-min-input-snr",
@@ -1236,6 +1344,30 @@ def main():
         type=float,
         default=DEFAULT_SINGLE_PIXEL_AREA_ATOL,
         help="Allowed absolute difference from full aperture area in pixels squared (default %(default)s).",
+    )
+    parser.add_argument(
+        "--reject-square-pixel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject experimental square-flux single-pixel candidates from cleaned catalogs (default on).",
+    )
+    parser.add_argument(
+        "--square-pixel-min-snr",
+        type=float,
+        default=DEFAULT_SQUARE_PIXEL_MIN_SNR,
+        help="Minimum input-image 3x3 S/N for the square-flux cut (default %(default)s).",
+    )
+    parser.add_argument(
+        "--square-pixel-min-1-over-3",
+        type=float,
+        default=DEFAULT_SQUARE_PIXEL_MIN_1_OVER_3,
+        help="Minimum input-image 1x1/3x3 flux ratio for rejection (default %(default)s).",
+    )
+    parser.add_argument(
+        "--square-pixel-min-3-over-5",
+        type=float,
+        default=DEFAULT_SQUARE_PIXEL_MIN_3_OVER_5,
+        help="Minimum input-image 3x3/5x5 flux ratio for rejection (default %(default)s).",
     )
     parser.add_argument(
         "--cross-convolve",
@@ -1475,6 +1607,11 @@ def main():
         threshold=args.threshold,
         threshold_column=args.threshold_column,
         cleaned_score_min_snr=args.cleaned_score_min_snr,
+        cleaned_simple_min_snr=args.cleaned_simple_min_snr,
+        star_rejection_match_radius=args.star_rejection_match_radius,
+        star_rejection_ref_mag=args.star_rejection_ref_mag,
+        star_rejection_scale=args.star_rejection_scale,
+        star_rejection_max_radius=args.star_rejection_max_radius,
         center_dq_flags=args.center_dq_flags,
         reject_center_jump_det=args.reject_center_jump_det,
         bad_pixel_columns=args.bad_pixel_columns,
@@ -1484,6 +1621,10 @@ def main():
         single_pixel_min_r2_r3=args.single_pixel_min_r2_r3,
         single_pixel_min_peak_r3=args.single_pixel_min_peak_r3,
         single_pixel_area_atol=args.single_pixel_area_atol,
+        reject_square_pixel=args.reject_square_pixel,
+        square_pixel_min_snr=args.square_pixel_min_snr,
+        square_pixel_min_1_over_3=args.square_pixel_min_1_over_3,
+        square_pixel_min_3_over_5=args.square_pixel_min_3_over_5,
         detection_kwargs=detection_kwargs,
         input_star_catalog_path=args.star_catalog,
         resample_method=args.resample_method,

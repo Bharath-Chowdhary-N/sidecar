@@ -32,7 +32,7 @@ def read_star_catalog(path, star_columns=("ra", "dec", "phot_g_mean_mag")):
     if path.suffix.lower() in [".parquet", ".pq"]:
         stars = read_catalog(path)
     elif path.suffix.lower() in [".ecsv"]:
-        stars = Table.read(path, format="ascii.ecsv")
+        stars = read_catalog(path)
     else:
         stars = Table.read(path, format="ascii")
 

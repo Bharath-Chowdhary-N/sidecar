@@ -17,6 +17,150 @@ DEFAULT_SINGLE_PIXEL_MIN_INPUT_SNR = 5.0
 DEFAULT_SINGLE_PIXEL_MIN_R2_R3 = 0.95
 DEFAULT_SINGLE_PIXEL_MIN_PEAK_R3 = 0.7
 DEFAULT_SINGLE_PIXEL_AREA_ATOL = 0.1
+DEFAULT_SQUARE_PIXEL_MIN_SNR = 20.0
+DEFAULT_SQUARE_PIXEL_MIN_1_OVER_3 = 0.8
+DEFAULT_SQUARE_PIXEL_MIN_3_OVER_5 = 0.9
+
+
+def measure_square_fluxes(data, x, y, background=0.0, mask=None, error=None):
+    """Measure background-subtracted 1x1, 3x3 and 5x5 pixel squares.
+
+    Squares are centered on the pixel nearest each (x, y) position using
+    ``numpy.rint``. An incomplete square, including a masked or nonfinite
+    pixel, has NaN flux and error. The ratios are NaN unless both fluxes are
+    finite and the denominator is positive. Flux errors ignore background
+    estimation uncertainty and pixel correlations.
+
+    Parameters
+    ----------
+    data : 2D array
+        Image values.
+    x, y : 1D arrays
+        Zero-based positions.
+    background : float or 1D array
+        Background per pixel, at each position.
+    mask : 2D bool array, optional
+        True for pixels to exclude.
+    error : 2D array, optional
+        Per-pixel standard deviation; nonfinite or nonpositive values are masked.
+
+    Returns
+    -------
+    dict of str to ndarray
+        ``square_1_flux``, ``square_3_flux``, ``square_5_flux``, corresponding
+        ``_flux_err`` and ``_snr`` values, and ``square_1_over_3`` and
+        ``square_3_over_5`` ratios.
+    """
+    data = np.asarray(data)
+    if data.ndim != 2:
+        raise ValueError("data must be two-dimensional")
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if x.ndim != 1 or x.shape != y.shape:
+        raise ValueError("x and y must be one-dimensional arrays with the same shape")
+    background = np.broadcast_to(np.asarray(background, dtype=float), x.shape)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != data.shape:
+            raise ValueError("mask must have the same shape as data")
+    if error is not None:
+        error = np.asarray(error)
+        if error.shape != data.shape:
+            raise ValueError("error must have the same shape as data")
+    result = {}
+    ny, nx = data.shape
+    for size in (1, 3, 5):
+        flux = np.full(x.shape, np.nan)
+        flux_err = np.full(x.shape, np.nan)
+        half = size // 2
+        eligible = np.isfinite(x) & np.isfinite(y) & np.isfinite(background)
+        eligible &= (x >= half - 0.5) & (x <= nx - half - 0.5)
+        eligible &= (y >= half - 0.5) & (y <= ny - half - 0.5)
+        for i in np.flatnonzero(eligible):
+            xc, yc = int(np.rint(x[i])), int(np.rint(y[i]))
+            if xc - half < 0 or xc + half >= nx or yc - half < 0 or yc + half >= ny:
+                continue
+            region = np.s_[yc - half : yc + half + 1, xc - half : xc + half + 1]
+            pixels = data[region]
+            if not np.all(np.isfinite(pixels)) or (mask is not None and np.any(mask[region])):
+                continue
+            if error is not None:
+                errors = error[region]
+                if not np.all(np.isfinite(errors) & (errors > 0)):
+                    continue
+                flux_err[i] = np.sqrt(np.sum(np.square(errors, dtype=float)))
+            flux[i] = np.sum(pixels, dtype=float) - size**2 * background[i]
+        result[f"square_{size}_flux"] = flux
+        result[f"square_{size}_flux_err"] = flux_err
+        with np.errstate(divide="ignore", invalid="ignore"):
+            result[f"square_{size}_snr"] = flux / flux_err
+    for numerator, denominator in ((1, 3), (3, 5)):
+        a = result[f"square_{numerator}_flux"]
+        b = result[f"square_{denominator}_flux"]
+        ratio = np.full(x.shape, np.nan)
+        np.divide(a, b, out=ratio, where=np.isfinite(a) & np.isfinite(b) & (b > 0))
+        result[f"square_{numerator}_over_{denominator}"] = ratio
+    return result
+
+
+def find_square_pixel_suspects(
+    catalog,
+    product,
+    min_snr=DEFAULT_SQUARE_PIXEL_MIN_SNR,
+    min_1_over_3=DEFAULT_SQUARE_PIXEL_MIN_1_OVER_3,
+    min_3_over_5=DEFAULT_SQUARE_PIXEL_MIN_3_OVER_5,
+):
+    """Flag experimental square-flux single-pixel candidates.
+
+    Positive residuals use the science image; negative residuals use the
+    template. The difference peak and product S/N must agree in sign. Rows
+    lacking finite ratios, positive flux, or sufficient input 3x3 S/N are
+    unassessable, not rejected. These thresholds are exploratory, not a
+    calibrated classifier.
+
+    Parameters
+    ----------
+    catalog : astropy.table.Table
+        Catalog with product and input measurements from ``measure_sources``.
+    product : str
+        Difference-image prefix (e.g. ``simple_diff`` or ``score``).
+    min_snr, min_1_over_3, min_3_over_5 : float
+        Minimum input 3x3 S/N and square flux ratios for flagging.
+
+    Returns
+    -------
+    suspect, measurable : tuple of numpy.ndarray
+        Boolean arrays identifying flagged and assessable rows.
+    """
+    for name, value in (("min_snr", min_snr), ("min_1_over_3", min_1_over_3), ("min_3_over_5", min_3_over_5)):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+
+    def values(column):
+        return np.ma.filled(np.ma.asarray(catalog[column], dtype=float), np.nan)
+
+    peak = values("peak_value")
+    product_snr = values(f"{product}_aper_r3_snr")
+    positive = peak > 0
+
+    def input_values(suffix):
+        return np.where(positive, values(f"science_{suffix}"), values(f"template_{suffix}"))
+
+    snr = input_values("square_3_snr")
+    flux3 = input_values("square_3_flux")
+    ratio13 = input_values("square_1_over_3")
+    ratio35 = input_values("square_3_over_5")
+    measurable = (
+        np.isfinite(peak)
+        & np.isfinite(product_snr)
+        & (((peak > 0) & (product_snr > 0)) | ((peak < 0) & (product_snr < 0)))
+        & np.isfinite(snr)
+        & (snr >= min_snr)
+        & np.isfinite(flux3)
+        & (flux3 > 0)
+        & np.isfinite(ratio13)
+        & np.isfinite(ratio35)
+    )
+    return measurable & (ratio13 >= min_1_over_3) & (ratio35 >= min_3_over_5), measurable
 
 
 def find_single_pixel_suspects(
@@ -240,6 +384,11 @@ def _measure_aperture(img, name, x, y, good, radii, bkg_radii, flag_radius, bad_
                 column(f"aper_r{r:g}_{name}")
         for name in ("local_bkg", "local_bkg_std", "peak", "peak_snr"):
             column(name)
+        for size in (1, 3, 5):
+            for name in ("flux", "flux_err", "snr"):
+                column(f"square_{size}_{name}")
+        column("square_1_over_3")
+        column("square_3_over_5")
         column("npix_nonfinite_in_aperture", dtype=int, fill=-1)
         if img.flags is not None:
             column("flags_center", dtype=np.int64, fill=-1)
@@ -262,6 +411,14 @@ def _measure_aperture(img, name, x, y, good, radii, bkg_radii, flag_radius, bad_
 
     column("local_bkg")[good] = bkg
     column("local_bkg_std")[good] = bkg_std
+    square_mask = finite_mask.copy()
+    flags = None
+    if img.flags is not None:
+        flags = np.asarray(img.flags).astype(np.int64)
+        square_mask |= (flags & bad_pixel_flags) != 0
+    squares = measure_square_fluxes(data, x[good], y[good], background=bkg, mask=square_mask, error=error)
+    for suffix, values in squares.items():
+        column(suffix)[good] = values
 
     for r in radii:
         aper = CircularAperture(pos, r)
@@ -300,7 +457,6 @@ def _measure_aperture(img, name, x, y, good, radii, bkg_radii, flag_radius, bad_
     column("npix_nonfinite_in_aperture", dtype=int, fill=-1)[good] = nonfinite
 
     if img.flags is not None:
-        flags = np.asarray(img.flags).astype(np.int64)
         apers = CircularAperture(pos, flag_radius).to_mask(method="center")
         yy = np.clip(np.rint(y[good]).astype(int), 0, flags.shape[0] - 1)
         xx = np.clip(np.rint(x[good]).astype(int), 0, flags.shape[1] - 1)
@@ -361,6 +517,8 @@ def measure_sources(
         - `<name>_aper_r<R>_flux`, `_flux_err`, `_snr`, `_npix_valid`: local-background-subtracted aperture
           photometry (errors need a noise plane)
         - `<name>_local_bkg`, `<name>_local_bkg_std`: sigma-clipped annulus median and std
+        - `<name>_square_<1|3|5>_flux`, `_flux_err`, `_snr`: background-subtracted square sums
+        - `<name>_square_1_over_3`, `<name>_square_3_over_5`: square flux ratios
         - `<name>_peak`, `<name>_peak_snr`: background-subtracted maximum within the smallest aperture
         - `<name>_npix_nonfinite_in_aperture`: NaN/inf pixels within `flag_radius`
         - `<name>_flags_center`, `_flags_or`, `_flags_npix_any`, `_flags_npix_bad`, `_flags_npix`: DQ flag
