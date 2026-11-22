@@ -125,7 +125,109 @@ sidecar/examples/perlmutter/test_sidecar_asdf_manualrdm.sh
   | science_band | science_observation_id | science_sca | template_band | template_observation_id | template_sca |
   ```
 - Subtraction: Perform image difference using [SFFT](https://github.com/thomasvrussell/sfft) algorithm.
-- Detection: Perform source detection using [Source-Extractor](https://sextractor.readthedocs.io/en/latest/Introduction.html).
+- Detection: Find positive and negative peaks in background-subtracted difference and score images using a
+  local background-RMS threshold (5 times the local RMS by default); catalog `peak_value` is background-subtracted.
+  Subtraction products store SFFT's blank-region mask in a separate `NO_COVERAGE` FITS extension.
+- Cleaned catalogs are written when known-star rejection is enabled. By default, stars with Gaia G
+  magnitude 16.5 or fainter use a 5 arcsec rejection radius; for brighter stars the radius is
+  `min(60, 5 * 10**(0.2 * (16.5 - G)))` arcsec. Nonempty star catalogs must include
+  `phot_g_mean_mag`; stars with missing magnitude values use the base radius.
+  Configure these values with `--star-rejection-match-radius`, `--star-rejection-ref-mag`,
+  `--star-rejection-scale`, and `--star-rejection-max-radius`. Set `--star-rejection-ref-mag none`
+  for a fixed radius or `--star-rejection-max-radius none` for no cap. These options apply to all
+  cleaned catalogs and are separate from the pixel-based bright-star masks used for SFFT source selection.
+  The defaults were tested on one field and can also reject real transients close to stars; validate them
+  for each dataset.
+  Cleaned score and simple-difference
+  catalogs also exclude sources with bad or unmeasured pixels in the 3-pixel flag aperture of the science,
+  template, or respective subtraction product, each measured at the source's sky position.
+  The cleaned score catalog additionally requires `abs(score_aper_r3_snr) >= 7`, configurable with
+  `--cleaned-score-min-snr`; significant negative detections are retained. The simple-difference catalog
+  has no S/N cut by default; `--cleaned-simple-min-snr` sets a minimum absolute r=3 aperture S/N.
+  The score-image aperture S/N uses the difference-image noise plane and does not fully
+  account for correlated noise, so this cut should be validated for each dataset. The product flag plane
+  currently combines science and template flags without resampling the template flags to the science grid.
+  Optionally, `--reject-center-jump-det` rejects `JUMP_DET` at the source center of any of these three
+  images; `--center-dq-flags MASK` rejects any bit in an additional integer DQ mask (decimal or `0x` hex).
+  Both are off by default. When enabled, unmeasured center flags are rejected as well.
+  Override the checked columns with `--bad-pixel-columns` and `--center-flag-columns`, followed by
+  space-separated names. Names beginning with `science_` or `template_` are used as-is; other names
+  receive the `score_` or `simple_diff_` prefix, depending on the catalog. For example,
+  `--bad-pixel-columns science_flags_npix_bad flags_npix_bad` checks science and the product.
+  Supplying `--bad-pixel-columns` without names disables the aperture bad-pixel cut in both catalogs;
+  `--center-flag-columns` requires at least one name.
+  All three cleaned catalogs also apply circular and square single-pixel artifact cuts by default.
+  These cuts run only when known-star rejection is enabled. For positive
+  detections the cut uses the science measurements; for negative detections it uses the template.
+  A candidate is rejected when its input-image r=3 S/N is at least 5, r=2/r=3 flux is at least 0.95,
+  and peak/r=3 flux is at least 0.7. The peak is the maximum pixel within the r=2 aperture, after
+  subtracting the local background. These limits can be changed with `--single-pixel-min-input-snr`,
+  `--single-pixel-min-r2-r3`, and `--single-pixel-min-peak-r3`, respectively. The r=2, 3, and 5
+  input apertures must have their full area to within `--single-pixel-area-atol` (default 0.1 square
+  pixels); the detection peak and r=3 S/N must have the same sign. Candidates with incomplete,
+  nonfinite, low-S/N, or sign-inconsistent measurements are retained and logged as inconclusive.
+  Disable the cut with `--no-reject-single-pixel`. These thresholds were explored on one field and
+  one SN candidate and should be validated against real sources, PSF variations, and injected sources.
+  Detection catalogs also contain local-background-subtracted square fluxes for each measured image:
+  `<image>_square_1_flux`, `_square_3_flux`, and `_square_5_flux` are whole-pixel sums in 1x1,
+  3x3, and 5x5 squares centered on the pixel nearest the candidate's position in that image.
+  Their `_flux_err` and `_snr` columns use the image noise plane and ignore correlations and
+  background-estimation uncertainty. `_square_1_over_3` and `_square_3_over_5` are the corresponding
+  flux ratios. A square with a bad, masked, nonfinite, or out-of-image pixel is unmeasured (NaN);
+  ratios are NaN if either sum is unavailable or the denominator is nonpositive.
+  The experimental square-flux cut flags rows with input-image
+  3x3 S/N >= 20, 1x1/3x3 >= 0.8, and 3x3/5x5 >= 0.9, using science for positive and template for
+  negative detections. Set the thresholds with `--square-pixel-min-snr`,
+  `--square-pixel-min-1-over-3`, and `--square-pixel-min-3-over-5`. The product peak and r=3 S/N
+  must agree in sign. Inconclusive measurements are retained and logged; disabling the square cut with
+  `--no-reject-square-pixel` does not disable the circular cut, and vice versa. The square cut runs after
+  the circular cut, and its experimental thresholds require broader validation.
+- Standalone star rejection accepts ECSV or Parquet for both detections and reference stars:
+  `python -m sidecar.reject_stars detections.parquet stars.ecsv`. Both this command and
+  `sidecar.pipeline` accept `--catalog-output-format parquet|ecsv|both` (default `parquet`) for catalog
+  outputs. `both` writes ECSV and a Parquet companion with the same stem; the ECSV path is
+  the primary path. For standalone star rejection, `--output` must have the `.parquet` extension
+  for `parquet`, or `.ecsv` for `ecsv` and `both`. Without `--output`, the name is
+  `cleaned_<input stem>` with the appropriate extension. Pipeline truth, detection, star, cleaned,
+  and matching catalogs use the selected format; FITS images are unaffected.
 - Truth Retrieval: Retrieve truth tables of the science image and template image.
 - Truth Matching: Match the truth information to the detected sources for evaluating efficiency. Match the detected sources to truth for evaluating purity.
 - Evaluation: Evaluate efficiency and purity.
+
+## Matching Catalogs Across Observations
+
+To cross-match sources across detection catalogs on `ra` and `dec`, use `sidecar.match_catalogs`.
+Entries must satisfy `template_in_bounds == True` by default. Additional boolean and numeric comparison cuts (`==`, `!=`, `>`, `<`, `>=`, `<=`) can be supplied with `--row-filter`.
+
+### Example: Multi-Filter Matching
+
+```bash
+python -m sidecar.match_catalogs \
+    ./subtractions/F*_15_-_F*_15/cleaned_score_*.ecsv \
+    --min-matches 3 \
+    --radius 1.0 \
+    --row-filter "score_in_bounds,==,True" \
+    --row-filter "score_peak_snr,>,10" \
+    --row-filter "score_flags_npix_bad,<=,0" \
+    --output matched_01062_cleaned_score_15.ecsv
+```
+
+In Python:
+
+```python
+from astropy.table import Table
+import astropy.units as u
+from sidecar.match_catalogs import match_catalogs
+
+tables = [Table.read("cat1.ecsv"), Table.read("cat2.ecsv")]
+matched = match_catalogs(
+    tables,
+    radius=1.0 * u.arcsec,
+    min_matches=2,
+    row_filters=[
+        ("score_in_bounds", "==", True),
+        ("score_peak_snr", ">", 10.0),
+        ("score_flags_npix_bad", "<=", 0),
+    ],
+)
+```

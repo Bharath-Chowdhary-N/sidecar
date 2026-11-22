@@ -1,19 +1,110 @@
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.table import Table
 from astropy.wcs import WCS
 
+from sidecar.catalog_io import read_catalog, write_catalog
 from snappl.dbclient import SNPITDBClient
 from snappl.imagecollection import ImageCollection
 
+DEFAULT_STAR_MAG_COL = "phot_g_mean_mag"
 
-INPUT_IMAGE_PATTERN = (
-    "RomanTDS/images/simple_model/{band}/{observation_id}/Roman_TDS_simple_model_{band}_{observation_id}_{sca}.fits.gz"
-)
+
+def star_rejection_radii(mags, match_radius, ref_mag=None, scale=0.2, max_radius=None):
+    """Rejection radius for each star as a function of magnitude.
+
+    Without `ref_mag` every star gets `match_radius`.  With it, a star brighter than `ref_mag`
+    gets match_radius * 10**(scale * (ref_mag - mag)), capped at `max_radius` (scale=0.2 grows as
+    flux**0.5, as in subtraction.make_bright_star_mask).  Stars fainter than `ref_mag`, or with an
+    undefined magnitude, get `match_radius`.
+
+    Parameters
+    ----------
+    mags : array-like of float
+    match_radius : astropy.units.Quantity or float
+        Base radius; a bare float is in arcsec.
+    ref_mag : float, optional
+    scale : float
+    max_radius : astropy.units.Quantity or float, optional
+        A bare float is in arcsec.
+
+    Returns
+    -------
+    astropy.units.Quantity
+        Radius per star, in arcsec.
+    """
+    base = u.Quantity(match_radius, u.arcsec).to(u.arcsec)
+    mags = np.ma.filled(np.ma.asarray(mags), np.nan).astype(float)
+    radii = np.full(mags.shape, base.value)
+    if ref_mag is not None:
+        bright = mags < ref_mag
+        radii[bright] = base.value * 10 ** (scale * (ref_mag - mags[bright]))
+    if max_radius is not None:
+        radii = np.minimum(radii, u.Quantity(max_radius, u.arcsec).to_value(u.arcsec))
+    return radii * u.arcsec
+
+
+def reject_stars(
+    detection,
+    stars,
+    match_radius,
+    frame="icrs",
+    ra_col="ra",
+    dec_col="dec",
+    star_ra_col="ra",
+    star_dec_col="dec",
+    mag_col=DEFAULT_STAR_MAG_COL,
+    ref_mag=None,
+    scale=0.2,
+    max_radius=None,
+):
+    """Remove detections lying within a (magnitude-dependent) radius of a reference star.
+
+    Parameters
+    ----------
+    detection : astropy.table.Table
+        Detections with `ra_col`, `dec_col` in degrees.
+    stars : astropy.table.Table
+        Reference stars (e.g., Gaia) with `star_ra_col`, `star_dec_col` in degrees,
+        and `mag_col` if `ref_mag` is given.
+    match_radius : astropy.units.Quantity or float
+        Rejection radius for stars no brighter than `ref_mag` (all stars if `ref_mag` is None).
+        A bare float is in arcsec.
+    frame : str
+        astropy coordinate frame of both catalogs, e.g., "icrs" or "fk5".
+    ref_mag, scale, max_radius :
+        Magnitude-dependent radius; see `star_rejection_radii`.
+
+    Returns
+    -------
+    astropy.table.Table
+        Copy of `detection` without the rejected rows.
+    """
+    if len(stars) < 1 or len(detection) < 1:
+        return detection.copy()
+
+    if ref_mag is not None and mag_col not in stars.colnames:
+        raise ValueError(f"Star catalog needs a '{mag_col}' column to use a magnitude-dependent radius")
+    mags = stars[mag_col] if ref_mag is not None else np.zeros(len(stars))
+    radii = star_rejection_radii(mags, match_radius, ref_mag=ref_mag, scale=scale, max_radius=max_radius)
+
+    def to_skycoord(table, ra, dec):
+        ra_deg, dec_deg = (np.asarray(table[c], dtype=float) for c in (ra, dec))
+        return SkyCoord(ra_deg, dec_deg, frame=frame, unit="deg")
+
+    star_skycoord = to_skycoord(stars, star_ra_col, star_dec_col)
+    detection_skycoord = to_skycoord(detection, ra_col, dec_col)
+    idx_det, idx_star, sep, _ = star_skycoord.search_around_sky(detection_skycoord, radii.max())
+    close = sep <= radii[idx_star]
+    rejected = np.zeros(len(detection), dtype=bool)
+    rejected[idx_det[close]] = True
+    return detection[~rejected]
 
 
 def get_image_info_for_ra_dec(ra, dec, collection, provenance_tag, process, band=None, dbclient=None):
@@ -349,6 +440,10 @@ def get_observation_id_sca_band_from_image_path(image_path):
     ('52395', 3, 'R062')
     >>> get_observation_id_sca_band_from_image_path("r9999901001001001001_0001_wfi01_f158_cal.asdf")
     ('99999010010010010010001', 1, 'F158')
+    >>> get_observation_id_sca_band_from_image_path("r9999901001001001001_0001_wfi01_f158_cal_tweak.asdf")
+    ('99999010010010010010001', 1, 'F158')
+    >>> get_observation_id_sca_band_from_image_path("r9999901001001001001_combined_wfi01_f158_cal_tweak.asdf")
+    ('99999010010010010010001', 1, 'F158')
     >>> get_observation_id_sca_band_from_image_path("SNPIT_VISIT602000033_WFI01_F106_L2.asdf")
     ('602000033', 1, 'F106')
 
@@ -365,8 +460,17 @@ def get_observation_id_sca_band_from_image_path(image_path):
             re.IGNORECASE,
         ),
         # RomanTDS simulated catalog / ASDF naming convention.
+        # This also describes the filenames from the Commissioning data
+        # The '.\+' after cal is to allow processing for post-processed images
+        # that got extra suffixes added to the filename.
         re.compile(
-            r"[rR]?(?P<observation_id>\d+)_(?P<observation_id_suffix>\d+)_wfi(?P<sca>\d+)_(?P<band>[A-Za-z0-9]+)_cal\.asdf",
+            r"[rR]?(?P<observation_id>\d+)(?:_(?P<observation_id_suffix>[^_]+))?_wfi(?P<sca>\d+)_(?P<band>[A-Za-z0-9]+)_cal.*\.asdf",  # noqa
+            re.IGNORECASE,
+        ),
+        # Make observation_id_suffix optional to allow for the case
+        #   where there is no suffix after the observation_id base.
+        re.compile(
+            r"[rR]?(?P<observation_id>\d+)_combined_wfi(?P<sca>\d+)_(?P<band>[A-Za-z0-9]+)_cal.*\.asdf",
             re.IGNORECASE,
         ),
         # RickSims ASDF naming convention.
@@ -388,8 +492,9 @@ def get_observation_id_sca_band_from_image_path(image_path):
             band = match.group("band").upper()
 
             # Handle ASDF naming case that has an incrementing suffix after the observation_id base.
-            if "observation_id_suffix" in match.groupdict() and match.group("observation_id_suffix") is not None:
-                observation_id += match.group("observation_id_suffix")
+            observation_id_suffix = match.groupdict().get("observation_id_suffix")
+            if observation_id_suffix is not None and observation_id_suffix.isdigit():
+                observation_id += observation_id_suffix
 
             return (observation_id, sca, band)
 
@@ -428,8 +533,8 @@ def read_data_records(data_records_path):
     return df
 
 
-def write_ds9_regions_from_ecsv(
-    ecsv_catalog_path,
+def write_ds9_regions_from_catalog(
+    catalog_path,
     ds9_region_path="ds9.reg",
     peak_value_threshold=100,
     ra_column="ra",
@@ -443,8 +548,8 @@ def write_ds9_regions_from_ecsv(
 
     Parameters
     ----------
-    ecsv_catalog_path : str or pathlib.Path
-        Path to the input ECSV catalog.
+    catalog_path : str or pathlib.Path
+        Path to the input catalog (ECSV or Parquet, chosen by suffix).
     ds9_region_path : str or pathlib.Path
         Output DS9 region file path.
     peak_value_threshold : float
@@ -467,29 +572,96 @@ def write_ds9_regions_from_ecsv(
     astropy.table.Table
         Filtered `astropy.table.Table` containing only rows with
         `peak_value` greater than `peak_value_threshold`. The returned table
-        preserves the original catalog columns in the `ecsv_catalog_path` file.
+        preserves the original catalog columns in the `catalog_path` file.
+
+    Notes
+    -----
+    If peak_value_column is None, "none", or "None";
+    or if peak_value_threshold is None,
+    then all sources are written to the DS9 region file.
     """
-    catalog = Table.read(ecsv_catalog_path, format="ascii.ecsv")
-    missing_columns = {ra_column, dec_column, peak_value_column} - set(catalog.colnames)
+    catalog = read_catalog(catalog_path)
+
+    # Normalize the CLI-style "none" string once so the rest only checks for None.
+    # if peak_value_column is already None, then this preserves that (by doing nothing).
+    if isinstance(peak_value_column, str) and peak_value_column.lower() == "none":
+        peak_value_column = None
+
+    required_columns = {ra_column, dec_column}
+    if peak_value_column is not None:
+        required_columns.add(peak_value_column)
+    missing_columns = required_columns - set(catalog.colnames)
     if len(missing_columns) > 0:
         raise ValueError(f"Catalog is missing required columns: {sorted(missing_columns)}")
 
-    mask = np.abs(catalog[peak_value_column]) > peak_value_threshold
+    mask = np.ones(len(catalog), dtype=bool)
+    if peak_value_column is not None and peak_value_threshold is not None:
+        mask = np.abs(catalog[peak_value_column]) > peak_value_threshold
 
     with open(ds9_region_path, "w") as region_file:
         region_file.write("# Region file format: DS9 version 4.1\n")
         region_file.write(
-            f"global color={region_color} width=1 font=\"helvetica 10 normal\" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1\n"  # noqa
+            f'global color={region_color} width=1 font="helvetica 10 normal" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1\n'  # noqa
         )
         region_file.write(f"{coord_system}\n")
 
         for row in catalog[mask]:
             ra = float(row[ra_column])
             dec = float(row[dec_column])
-            peak_value = float(row[peak_value_column])
-            region_file.write(f"circle({ra:.8f}, {dec:.8f}, {radius_arcsec:.3f}\")  # text={{{peak_value:.0f}}}\n")
+            line = f'circle({ra:.8f}, {dec:.8f}, {radius_arcsec:.3f}")'
+            if peak_value_column is not None:
+                peak_value = float(row[peak_value_column])
+                line += f"  # text={{{peak_value:.2f}}}"
+            region_file.write(line + "\n")
 
     return catalog[mask]
+
+
+def filter_catalog_by_abs_threshold(
+    catalog_path, column, threshold, output_path=None, prefix="filtered_", min_inclusive=True
+):
+    """Keep catalog rows where ``abs(column)`` is finite and at least ``threshold``.
+
+    Parameters
+    ----------
+    catalog_path : str or pathlib.Path
+        Input catalog (ECSV or Parquet, chosen by suffix).
+    column : str
+        Column whose absolute value is thresholded.
+    threshold : float
+    output_path : str or pathlib.Path, optional
+        Output catalog; defaults to ``prefix`` + the input file name.  It is written
+        in the same format as the input.
+    prefix : str
+        Prefix for the default output name.
+    min_inclusive : bool
+        If True keep ``abs(column) >= threshold``, otherwise ``>``.
+
+    Returns
+    -------
+    (astropy.table.Table, pathlib.Path)
+        The selected rows and the path they were written to.
+    """
+    catalog_path = Path(catalog_path)
+    catalog = read_catalog(catalog_path)
+    if column not in catalog.colnames:
+        raise ValueError(f"Catalog {catalog_path} is missing column {column!r}")
+    values = np.ma.filled(np.ma.asarray(catalog[column], dtype=float), np.nan)
+    with np.errstate(invalid="ignore"):
+        keep = np.isfinite(values) & (np.abs(values) >= threshold if min_inclusive else np.abs(values) > threshold)
+    selected = catalog[keep]
+    if output_path is None:
+        output_path = catalog_path.with_name(prefix + catalog_path.name)
+    output_path = Path(output_path)
+    suffix = output_path.suffix.lower()
+    if suffix in (".parquet", ".pq"):
+        output_format = "parquet"
+    elif suffix == ".ecsv":
+        output_format = "ecsv"
+    else:
+        raise ValueError(f"Unsupported catalog suffix {suffix!r}; use .ecsv or .parquet")
+    write_catalog(selected, output_path, overwrite=True, output_format=output_format)
+    return selected, output_path
 
 
 def load_wcs_from_fits(path, hdu_id=0):
