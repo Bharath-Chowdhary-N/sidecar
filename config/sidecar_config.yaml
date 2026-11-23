@@ -27,11 +27,11 @@ photometry:
     real_bogus:
       # Detections with real_bogus_score >= threshold are labelled "real".
       threshold: 0.5
-      # Where the Hugging Face model ensemble is downloaded and cached.
-      # null -> ~/roman_sn_pit_models
-      model_dir: null
-      # Where to run the CNNs: auto (GPU if available), cpu, or cuda.
-      device: auto
+      # Where the Hugging Face model ensemble lives.  Pipeline jobs only read
+      # from here; download the models once beforehand with
+      #   python -m sidecar.classifier --download-models
+      # See the README ("Real/bogus models").
+      model_dir: ${system.paths.dev_storage}/sidecar/real_bogus_models
 
     psf:
       type: STPSF

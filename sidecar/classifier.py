@@ -8,13 +8,15 @@ The entry point is :func:`process_single_catalog_ensemble`. It
 
 1. loads the 24-model CNN ensemble published on Hugging Face as
    ``Roman-Supernova-PIT/transient-real-bogus`` (6 architecture families x 4
-   independently trained members), downloading it on first use and caching it
-   locally;
-2. reads the detection catalog (ECSV) and the difference image (FITS) the
+   independently trained members) from ``model_dir``
+   (``photometry.sidecar.real_bogus.model_dir`` in the config). The models
+   are not downloaded during a run: fetch them once beforehand with
+   ``python -m sidecar.classifier --download-models`` (see :func:`main`);
+2. reads the detection catalog (ECSV or Parquet) and the difference image (FITS) the
    detections were measured on;
 3. for every detection, makes a 64x64 cutout centred on its position, in
    memory, and scores it with every model;
-4. writes the catalog out as Parquet with per-family scores, the ensemble
+4. writes the catalog out (Parquet or ECSV, like the rest of the pipeline) with per-family scores, the ensemble
    score, its spread, and a "real"/"bogus"/"invalid" label added as columns.
 
 It is called from ``sidecar/pipeline.py`` (``Detection.run_one_subtraction``)
@@ -26,15 +28,19 @@ z-scaled to [0, 1], a sub-pixel bilinear cutout is taken from it, and that
 cutout is z-scaled to [0, 1] again (see :func:`make_model_cutout`).
 """
 
+import argparse
 import glob
 import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from astropy.io import ascii, fits
+from astropy.io import fits
 from scipy.interpolate import RegularGridInterpolator
+from snappl.config import Config
 from snappl.logger import SNLogger
+
+from sidecar.catalog_io import OUTPUT_FORMATS, read_catalog, write_catalog
 
 
 # ============================================================================
@@ -722,21 +728,67 @@ def ensure_models_downloaded(model_dir, families):
 
     Notes
     -----
-    Needs network access the first time each family is used, and Hugging Face
-    credentials that can read ``REPO_ID`` (e.g. via ``hf auth login`` or the
-    ``HF_TOKEN`` environment variable), since the repository is not publicly
-    readable.
+    Needs network access and Hugging Face credentials that can read
+    ``REPO_ID`` (e.g. via ``hf auth login`` or the ``HF_TOKEN`` environment
+    variable), since the repository is not publicly readable.
+
+    This is meant to be run once per system, before launching pipeline jobs
+    (``python -m sidecar.classifier --download-models``), not from inside
+    the jobs: many jobs downloading into the same ``model_dir`` at once would
+    race each other, and jobs on fresh containers would each download their
+    own copy.
     """
     missing = [fam for fam in families if not family_is_cached(model_dir, fam)]
     if not missing:
         return model_dir
+    # Imported here so that pipeline jobs, which only read the models, do not
+    # need huggingface_hub.
     from huggingface_hub import snapshot_download
     patterns = ["README.md"] + [p for fam in missing for p in (f"{fam}/*.pth", f"{fam}/README.md")]
     return snapshot_download(repo_id=REPO_ID, local_dir=model_dir, allow_patterns=patterns)
 
 
-def load_ensemble(model_dir, families, device):
-    """Load the trained models of the requested families, downloading if needed.
+def check_models_available(model_dir, families):
+    """Raise if any requested family is missing from ``model_dir``.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model directory.
+    families : list of str
+        Families that are needed.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any family in ``families`` does not have all its checkpoints in
+        ``model_dir`` (see :func:`family_is_cached`). The message says how to
+        download them.
+    """
+    missing = [fam for fam in families if not family_is_cached(model_dir, fam)]
+    if missing:
+        raise FileNotFoundError(
+            f"Real/bogus models missing from {model_dir}: {', '.join(missing)}. "
+            f"Download them once before running the pipeline with "
+            f"'python -m sidecar.classifier --download-models --model-dir {model_dir}', "
+            f"or run the pipeline with --no-real-bogus."
+        )
+
+
+def default_model_dir():
+    """Return the configured model directory.
+
+    Returns
+    -------
+    str
+        ``photometry.sidecar.real_bogus.model_dir`` from the default snappl
+        config (by default ``${system.paths.dev_storage}/sidecar/real_bogus_models``).
+    """
+    return Config.get().value("photometry.sidecar.real_bogus.model_dir")
+
+
+def load_ensemble(model_dir, families, device, download=False):
+    """Load the trained models of the requested families.
 
     For each family, every checkpoint matching
     ``<model_dir>/<family>/<family>_Ensemble_Model*_best.pth`` is loaded (in
@@ -747,24 +799,34 @@ def load_ensemble(model_dir, families, device):
     Parameters
     ----------
     model_dir : str or Path
-        Local model cache directory (see :func:`ensure_models_downloaded`).
+        Local model directory (see :func:`ensure_models_downloaded`).
     families : list of str
         Families to load, from ``ALL_FAMILIES``.
     device : torch.device
         Device to place the models on.
+    download : bool, optional
+        If True, download missing families first with
+        :func:`ensure_models_downloaded`. Default False: missing families
+        raise instead (see :func:`check_models_available`), so that parallel
+        pipeline jobs never download.
 
     Returns
     -------
     dict of str to list of torch.nn.Module
-        ``{family: [model, ...]}`` in the order of ``families``. A family with
-        no checkpoint files is left out.
+        ``{family: [model, ...]}`` in the order of ``families``.
 
     Raises
     ------
+    FileNotFoundError
+        If ``download`` is False and a requested family is not in
+        ``model_dir``.
     RuntimeError
         If no model at all could be loaded.
     """
-    model_dir = ensure_models_downloaded(model_dir, families)
+    if download:
+        model_dir = ensure_models_downloaded(model_dir, families)
+    else:
+        check_models_available(model_dir, families)
     family_models = {}
     for fam in families:
         models = []
@@ -1010,11 +1072,12 @@ def score_detection(row, x_col, y_col, normalized_image, family_models, device,
 
 def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
                                      model_dir=None, families=None,
-                                     cutout_size=64, threshold=0.5, device="auto"):
+                                     cutout_size=64, threshold=0.5, device="auto",
+                                     output_format="parquet"):
     """Add real/bogus scores for every detection in a catalog and save it.
 
-    Loads the ensemble (:func:`load_ensemble`, downloading from Hugging Face
-    on first use), reads the catalog and the difference image, z-scales the
+    Loads the ensemble from ``model_dir`` (:func:`load_ensemble`; nothing is
+    downloaded, see :func:`main`), reads the catalog and the difference image, z-scales the
     whole image once, then scores each row with :func:`score_detection`.
     Cutouts are made in memory; no cutout files are written. The input
     catalog is not modified; the result is written to ``output_path``.
@@ -1022,17 +1085,19 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
     Parameters
     ----------
     catalog_path : str or Path
-        Input ECSV detection catalog. Must have ``x_centroid``/``y_centroid``
+        Input detection catalog, ECSV or Parquet (read with
+        :func:`sidecar.catalog_io.read_catalog`, by file suffix). Must have ``x_centroid``/``y_centroid``
         or ``X_IMAGE``/``Y_IMAGE`` columns (see :func:`detect_catalog_type`).
     fits_path : str or Path
         Difference image the detections were measured on, e.g. sidecar's
         ``decorr_diff_*.fits`` (read with :func:`load_fits_2d_ensemble`).
         Catalog positions must be in this image's pixel coordinates.
     output_path : str or Path
-        Where to write the scored catalog, as Parquet. Overwritten if it exists.
+        Where to write the scored catalog. Overwritten if it exists.
         Table metadata (threshold, model dir, etc.) is kept in the file.
     model_dir : str or Path, optional
-        Local cache for the ensemble weights. Default ``~/roman_sn_pit_models``.
+        Directory holding the ensemble weights. Default: the configured
+        ``photometry.sidecar.real_bogus.model_dir`` (see :func:`default_model_dir`).
     families : list of str, optional
         Subset of ``ALL_FAMILIES`` to use. Default: all 6.
     cutout_size : int, optional
@@ -1045,6 +1110,9 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
         Where to run the models (see :func:`resolve_device`). Default
         ``"auto"``: the GPU if PyTorch can see one, otherwise the CPU. Use
         ``"cpu"`` to force CPU inference on a GPU machine.
+    output_format : {"parquet", "ecsv"}, optional
+        Format of the output catalog (see
+        :func:`sidecar.catalog_io.write_catalog`). Default ``"parquet"``.
 
     Returns
     -------
@@ -1059,13 +1127,18 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
     ------
     ValueError
         If the catalog has no recognised position columns, the FITS file has
-        no image data, or ``device`` is not "auto", "cpu" or "cuda".
+        no image data, ``device`` is not "auto", "cpu" or "cuda", or
+        ``output_format`` is not one of ``OUTPUT_FORMATS``.
+    FileNotFoundError
+        If a requested model family is not in ``model_dir``.
     RuntimeError
         If no models could be loaded, or ``device="cuda"`` but no GPU is
         available.
     """
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, not {output_format!r}")
     if model_dir is None:
-        model_dir = os.path.expanduser("~/roman_sn_pit_models")
+        model_dir = default_model_dir()
     if families is None:
         families = ALL_FAMILIES
 
@@ -1073,7 +1146,7 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
     family_models = load_ensemble(model_dir, families, device)
     total_models = sum(len(v) for v in family_models.values())
 
-    data = ascii.read(str(catalog_path), format='ecsv')
+    data = read_catalog(catalog_path)
     catalog_type, x_col, y_col, id_col = detect_catalog_type(data)
 
     normalized_full = normalize_with_zscale(load_fits_2d_ensemble(fits_path))
@@ -1096,4 +1169,56 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
     data.meta["real_bogus_n_models"] = total_models
     data.meta["real_bogus_cutout_size"] = cutout_size
 
-    data.write(output_path, format='parquet', overwrite=True)
+    write_catalog(data, output_path, overwrite=True, output_format=output_format)
+
+
+def main(argv=None):
+    """Command-line entry point: download the model ensemble once.
+
+    Run this once per system, before launching pipeline jobs, so that the
+    jobs can all read the same models from ``model_dir`` without any of them
+    downloading::
+
+        python -m sidecar.classifier --download-models
+
+    Needs network access and Hugging Face credentials for ``REPO_ID``
+    (``hf auth login`` or ``HF_TOKEN``). Families already present are skipped.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Arguments to parse instead of ``sys.argv[1:]``.
+    """
+    parser = argparse.ArgumentParser(
+        description="Manage the real/bogus CNN model ensemble used by the sidecar pipeline."
+    )
+    parser.add_argument(
+        "--download-models",
+        action="store_true",
+        help=f"Download the model ensemble from Hugging Face ({REPO_ID}) into --model-dir.",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=None,
+        help="Where to put the models.  Defaults to photometry.sidecar.real_bogus.model_dir in the config.",
+    )
+    parser.add_argument(
+        "--families",
+        nargs="+",
+        default=ALL_FAMILIES,
+        choices=ALL_FAMILIES,
+        help="Model families to download.  Default: all.",
+    )
+    args = parser.parse_args(argv)
+    if not args.download_models:
+        parser.error("nothing to do; pass --download-models")
+
+    model_dir = args.model_dir if args.model_dir is not None else default_model_dir()
+    SNLogger.info(f"Downloading real/bogus models ({', '.join(args.families)}) into {model_dir}")
+    ensure_models_downloaded(model_dir, args.families)
+    check_models_available(model_dir, args.families)
+    SNLogger.info(f"Real/bogus models are ready in {model_dir}")
+
+
+if __name__ == "__main__":
+    main()

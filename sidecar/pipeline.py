@@ -121,7 +121,6 @@ class Detection:
         psf_size=None,
         reject_known_stars=True,
         real_bogus=True,
-        rb_device=None,
         cross_convolve=False,
         backend4subtract=None,
         save_debug_products=False,
@@ -202,11 +201,6 @@ class Detection:
         self.psf_size = psf_size
         self.reject_known_stars = reject_known_stars
         self.real_bogus = real_bogus
-        # CLI/constructor value wins; otherwise the config value; otherwise "auto".
-        if rb_device is not None:
-            self.rb_device = rb_device
-        else:
-            self.rb_device = self.config.value("photometry.sidecar.real_bogus.device", default="auto")
         self.star_rejection_match_radius = star_rejection_match_radius
         self.star_rejection_options = {
             "ref_mag": star_rejection_ref_mag,
@@ -589,11 +583,11 @@ class Detection:
         # real/bogus classification
         file_path["real_bogus_score_detection_path"] = Path(
             file_path["full_output_dir"],
-            self.REAL_BOGUS_PREFIX + self.SCORE_DETECTION_PREFIX + diff_pattern + ".parquet",
+            self.REAL_BOGUS_PREFIX + self.SCORE_DETECTION_PREFIX + diff_pattern + ".ecsv",
         )
         file_path["real_bogus_cleaned_score_detection_path"] = Path(
             file_path["full_output_dir"],
-            self.REAL_BOGUS_PREFIX + self.CLEANED_SCORE_DETECTION_PREFIX + diff_pattern + ".parquet",
+            self.REAL_BOGUS_PREFIX + self.CLEANED_SCORE_DETECTION_PREFIX + diff_pattern + ".ecsv",
         )
         file_path["transients_to_score_detection_path"] = Path(
             file_path["full_output_dir"],
@@ -694,7 +688,8 @@ class Detection:
         cross_convolve : bool
             Accepted for compatibility; the instance's `self.cross_convolve` is what is passed to the subtraction.
         backend4subtract : str
-            SFFT backend, e.g. "Cupy" or "numpy".
+            SFFT backend, e.g. "Cupy" or "numpy".  Also sets the real/bogus CNN device:
+            "Cupy" runs them on the GPU (cuda), anything else on the CPU.
         assume_subtraction_has_been_run : bool
             Skip the subtraction and use the products already in the output directory.
             This is intended for debugging, particularly of the source detection and measurement stage.
@@ -936,7 +931,9 @@ class Detection:
                 output_path=file_path[f"real_bogus_{rb_input_key}"],
                 model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir", default=None),
                 threshold=self.config.value("photometry.sidecar.real_bogus.threshold", default=0.5),
-                device=self.rb_device,
+                # Run the CNNs on the same hardware as the subtraction.
+                device="cuda" if backend4subtract.lower() == "cupy" else "cpu",
+                output_format=self.output_format,
             )
 
         SNLogger.info("Processing subtraction finished.")
@@ -1257,15 +1254,8 @@ def main():
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Add CNN real/bogus scores to the score detection catalog.  "
-        "Downloads the model ensemble from Hugging Face on first use.",
-    )
-    parser.add_argument(
-        "--rb-device",
-        type=str,
-        default=None,
-        choices=["auto", "cpu", "cuda"],
-        help="Where to run the real/bogus CNNs: 'auto' (GPU if available), 'cpu' or 'cuda'.  "
-        "Defaults to photometry.sidecar.real_bogus.device in the config, else 'auto'.",
+        "Reads the model ensemble from photometry.sidecar.real_bogus.model_dir; "
+        "download it once beforehand with 'python -m sidecar.classifier --download-models'.",
     )
     parser.add_argument(
         "--match-truth", default=False, action=argparse.BooleanOptionalAction, help="Match to truth catalog."
@@ -1432,7 +1422,8 @@ def main():
         type=str,
         default="Cupy",
         choices=["Cupy", "Numpy", "cupy", "numpy"],
-        help="Which backend to use for subtraction",
+        help="Which backend to use for subtraction.  Also sets where the real/bogus CNNs run: "
+        "Cupy -> GPU (cuda), Numpy -> CPU.",
     )
     parser.add_argument(
         "--max-peak",
@@ -1649,7 +1640,6 @@ def main():
         psf_size=args.psf_size,
         reject_known_stars=args.reject_known_stars,
         real_bogus=args.real_bogus,
-        rb_device=args.rb_device,
         temp_dir=args.temp_dir,
         output_dir=args.output_dir,
         output_format=args.catalog_output_format,

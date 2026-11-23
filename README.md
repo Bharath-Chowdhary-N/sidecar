@@ -22,6 +22,41 @@ git clone https://github.com/Roman-Supernova-PIT/sidecar.git
 
 Once cloning is complete, navigate to the 'sidecar' directory.
 
+## Real/bogus models (run once per system)
+
+By default the pipeline scores detections with a CNN real/bogus ensemble
+(`--real-bogus`). Pipeline jobs only *read* the models from
+`photometry.sidecar.real_bogus.model_dir`, which defaults to
+`${system.paths.dev_storage}/sidecar/real_bogus_models`. They never download
+them, so many parallel jobs can share one copy without racing to write it.
+
+Before launching a set of jobs on a system, download the models once into
+that directory, from inside the SNPIT environment on a node with network
+access:
+
+```bash
+# The Hugging Face repository is private: log in once or set HF_TOKEN.
+hf auth login            # or: export HF_TOKEN=...
+python -m sidecar.classifier --download-models
+```
+
+Families already present are skipped, so it is safe to run again. Use
+`--model-dir DIR` to download somewhere else, and point
+`photometry.sidecar.real_bogus.model_dir` at the same place. The directory
+must be on storage that every job (container) mounts.
+
+If the models are missing, the pipeline stops with an error explaining how to
+download them. To run without real/bogus scoring, pass `--no-real-bogus`.
+
+The CNNs run on the same device as the subtraction: `--backend4subtract Cupy`
+uses the GPU, `numpy` the CPU.
+
+Cut-and-paste example (SMDC):
+[`examples/smdc/fetch_real_bogus_models.sh`](examples/smdc/fetch_real_bogus_models.sh)
+downloads the models once, then
+[`examples/smdc/asdf49_wfi01_run_one_real_bogus_slurm.sbatch`](examples/smdc/asdf49_wfi01_run_one_real_bogus_slurm.sbatch)
+runs one subtraction with real/bogus scoring.
+
 ## Step 3: Detection
 
 To run the detection pipeline, run the following code in `sidecar` repo of the terminal.
