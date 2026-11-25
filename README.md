@@ -25,12 +25,12 @@ Once cloning is complete, navigate to the 'sidecar' directory.
 ### Installing outside the container (pip)
 
 The default install is CPU-only. PyPI's Linux `torch` wheel bundles CUDA
-(several GB of `nvidia-*` packages), so install the CPU build of PyTorch
-first; pip then sees `torch` is already satisfied and will not fetch the
-CUDA one:
+(several GB of `nvidia-*` packages), so install the CPU builds of PyTorch
+and torchvision (needed by `timm`) first; pip then sees they are already
+satisfied and will not fetch the CUDA ones:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -e .
 ```
 
