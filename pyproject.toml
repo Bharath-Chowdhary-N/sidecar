@@ -43,6 +43,12 @@ file = "README.md"
 content-type = "text/markdown"
 
 [project.optional-dependencies]
+# GPU support: CuPy for `--backend4subtract Cupy` (SFFT) and the CUDA build
+# of PyTorch for the real/bogus CNNs (PyPI's Linux torch wheel is the CUDA one).
+gpu = [
+    "cupy-cuda12x",
+    "torch",
+]
 test = [
     "matplotlib",
     "pytest",

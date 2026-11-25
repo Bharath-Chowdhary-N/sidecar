@@ -22,6 +22,25 @@ git clone https://github.com/Roman-Supernova-PIT/sidecar.git
 
 Once cloning is complete, navigate to the 'sidecar' directory.
 
+### Installing outside the container (pip)
+
+The default install is CPU-only. PyPI's Linux `torch` wheel bundles CUDA
+(several GB of `nvidia-*` packages), so install the CPU build of PyTorch
+first; pip then sees `torch` is already satisfied and will not fetch the
+CUDA one:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+```
+
+For GPU (`--backend4subtract Cupy`), install the `gpu` extra instead, which
+adds CuPy and the CUDA build of PyTorch:
+
+```bash
+pip install -e ".[gpu]"
+```
+
 ## Real/bogus models (run once per system)
 
 By default the pipeline scores detections with a CNN real/bogus ensemble
