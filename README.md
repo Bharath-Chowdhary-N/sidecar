@@ -49,6 +49,22 @@ By default the pipeline scores detections with a CNN real/bogus ensemble
 `${system.paths.dev_storage}/sidecar/real_bogus_models`. They never download
 them, so many parallel jobs can share one copy without racing to write it.
 
+### Getting access to the models
+
+The models are in the private Hugging Face repository
+[`Roman-Supernova-PIT/transient-real-bogus`](https://huggingface.co/Roman-Supernova-PIT/transient-real-bogus).
+Because it is private, access is granted by adding you to the
+`Roman-Supernova-PIT` Hugging Face organization:
+
+1. Create a free Hugging Face account at https://huggingface.co/join.
+2. Email your Hugging Face username to Dr. Benjamin Rose (ben_rose@baylor.edu) and
+   ask to be added to the `Roman-Supernova-PIT` organization.
+3. Once added, create a read-access token at
+   https://huggingface.co/settings/tokens and log in with `hf auth login`
+   (or `export HF_TOKEN=<your token>`).
+
+### Downloading the models
+
 Before launching a set of jobs on a system, download the models once into
 that directory, from inside the SNPIT environment on a node with network
 access:
