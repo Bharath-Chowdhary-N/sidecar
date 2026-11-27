@@ -86,6 +86,27 @@ download them. To run without real/bogus scoring, pass `--no-real-bogus`.
 The CNNs run on the same device as the subtraction: `--backend4subtract Cupy`
 uses the GPU, `numpy` the CPU.
 
+### 3-channel (science, template, diff) models
+
+A second ensemble,
+[`Roman-Supernova-PIT/Real-Bogus-3ch`](https://huggingface.co/Roman-Supernova-PIT/Real-Bogus-3ch)
+(DenseNet121 + ConvNeXtTiny, 4 members each, same access as above), scores
+each detection on science, template and diff cutouts instead of the diff
+alone. Download it once into `photometry.sidecar.real_bogus.model_dir_3ch`
+(default `${system.paths.dev_storage}/sidecar/real_bogus_3ch_models`):
+
+```bash
+python -m sidecar.classifier --download-models --model-type 3ch
+```
+
+and select it with `photometry.sidecar.real_bogus.model: 3ch` in the config
+(or `--photometry-sidecar-real_bogus-model 3ch` on the command line). The
+subtraction then also writes `rb_science_*.fits` (sky-subtracted science) and
+`rb_template_*.fits` (template resampled onto the science grid) to the output
+directory, and the scores go to the same `real_bogus_*` catalog. Its
+threshold is `photometry.sidecar.real_bogus.threshold_3ch` (default 0.5, not
+yet tuned on sidecar subtractions).
+
 Cut-and-paste example (SMDC):
 [`examples/smdc/fetch_real_bogus_models.sh`](examples/smdc/fetch_real_bogus_models.sh)
 downloads the models once, then

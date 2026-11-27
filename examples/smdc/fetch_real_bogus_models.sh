@@ -17,3 +17,6 @@ cd /home/sidecar; pip install -e . --no-deps
 cd /home
 
 python -m sidecar.classifier --download-models
+# Optional: the 3-channel (science, template, diff) ensemble, used with
+# photometry.sidecar.real_bogus.model: 3ch
+python -m sidecar.classifier --download-models --model-type 3ch

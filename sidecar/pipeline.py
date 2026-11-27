@@ -712,6 +712,11 @@ class Detection:
             "Processing started for data records " f"| Science ID {science_id} " f"| Template ID {template_id} "
         )
 
+        # Which real/bogus ensemble to use: "diff" (difference image only) or "3ch" (science, template, diff).
+        real_bogus_model = self.config.value("photometry.sidecar.real_bogus.model", default="diff")
+        if real_bogus and real_bogus_model not in ("diff", "3ch"):
+            raise ValueError(f"photometry.sidecar.real_bogus.model must be 'diff' or '3ch', not {real_bogus_model!r}")
+
         SNLogger.info("Processing subtraction")
         subtract = subtraction.Pipeline(
             image_collection=image_collection,
@@ -734,6 +739,7 @@ class Detection:
             resample_method=self.resample_method,
             sfft_kwargs=self.sfft_kwargs,
             pre_smooth_sigma=self.pre_smooth_sigma,
+            save_real_bogus_3ch_inputs=real_bogus and real_bogus_model == "3ch",
         )
         SNLogger.info("Finished subtraction")
 
@@ -923,18 +929,32 @@ class Detection:
             # score-image detections. Needs no truth, so this also runs on real data.
             rb_input_key = "cleaned_score_detection_path" if reject_known_stars else "score_detection_path"
             rb_catalog_path = file_path[rb_input_key]
-            SNLogger.info(f"Adding real/bogus classifier scores to {rb_catalog_path.name}")
+            SNLogger.info(f"Adding {real_bogus_model} real/bogus classifier scores to {rb_catalog_path.name}")
+            # Run the CNNs on the same hardware as the subtraction.
+            rb_device = "cuda" if backend4subtract.lower() == "cupy" else "cpu"
             # cutout_size is not configurable: it is fixed by the trained models (64x64).
-            classifier.process_single_catalog_ensemble(
-                catalog_path=rb_catalog_path,
-                fits_path=file_path["difference_image_path"],
-                output_path=file_path[f"real_bogus_{rb_input_key}"],
-                model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir", default=None),
-                threshold=self.config.value("photometry.sidecar.real_bogus.threshold", default=0.5),
-                # Run the CNNs on the same hardware as the subtraction.
-                device="cuda" if backend4subtract.lower() == "cupy" else "cpu",
-                output_format=self.output_format,
-            )
+            if real_bogus_model == "3ch":
+                classifier.process_single_catalog_ensemble_3ch(
+                    catalog_path=rb_catalog_path,
+                    science_path=subtract.rb_science_path,
+                    template_path=subtract.rb_template_path,
+                    diff_path=file_path["difference_image_path"],
+                    output_path=file_path[f"real_bogus_{rb_input_key}"],
+                    model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir_3ch", default=None),
+                    threshold=self.config.value("photometry.sidecar.real_bogus.threshold_3ch", default=0.5),
+                    device=rb_device,
+                    output_format=self.output_format,
+                )
+            else:
+                classifier.process_single_catalog_ensemble(
+                    catalog_path=rb_catalog_path,
+                    fits_path=file_path["difference_image_path"],
+                    output_path=file_path[f"real_bogus_{rb_input_key}"],
+                    model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir", default=None),
+                    threshold=self.config.value("photometry.sidecar.real_bogus.threshold", default=0.5),
+                    device=rb_device,
+                    output_format=self.output_format,
+                )
 
         SNLogger.info("Processing subtraction finished.")
 
@@ -1254,8 +1274,9 @@ def main():
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Add CNN real/bogus scores to the score detection catalog.  "
-        "Reads the model ensemble from photometry.sidecar.real_bogus.model_dir; "
-        "download it once beforehand with 'python -m sidecar.classifier --download-models'.",
+        "photometry.sidecar.real_bogus.model picks the ensemble: 'diff' (default) reads it from "
+        "photometry.sidecar.real_bogus.model_dir, '3ch' (science, template, diff) from model_dir_3ch; "
+        "download it once beforehand with 'python -m sidecar.classifier --download-models [--model-type 3ch]'.",
     )
     parser.add_argument(
         "--match-truth", default=False, action=argparse.BooleanOptionalAction, help="Match to truth catalog."

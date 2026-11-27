@@ -26,6 +26,11 @@ catalog, so it runs on real data as well as simulations.
 Preprocessing must match training exactly: the whole difference image is
 z-scaled to [0, 1], a sub-pixel bilinear cutout is taken from it, and that
 cutout is z-scaled to [0, 1] again (see :func:`make_model_cutout`).
+
+A second, 3-channel ensemble (``Roman-Supernova-PIT/Real-Bogus-3ch``) scores
+(science, template, diff) cutouts instead of the difference alone; see
+:func:`process_single_catalog_ensemble_3ch`. Each channel gets the same
+preprocessing as above.
 """
 
 import argparse
@@ -492,7 +497,7 @@ def create_cutout(data, center_y, center_x, cutout_size=64):
     return interpolator((yy, xx)).astype(data.dtype)
 
 
-def load_fits_2d_ensemble(fits_path):
+def load_fits_2d_ensemble(fits_path, nan_to_zero=True):
     """Read the 2D image from a FITS file as float64, with NaN/inf set to 0.
 
     Unlike reading ``hdul[0].data`` directly, this also handles sidecar's
@@ -510,12 +515,18 @@ def load_fits_2d_ensemble(fits_path):
     ----------
     fits_path : str or Path
         Path to the FITS file.
+    nan_to_zero : bool, optional
+        If True (default), NaN and +/-inf pixels are replaced by 0. If False
+        they are kept, so that :func:`normalize_with_zscale` leaves them out
+        of the z-scale limits (as for the science and template channels of the
+        3-channel ensemble).
 
     Returns
     -------
     numpy.ndarray
         2D float64 image. A 3D cube is reduced to its first plane; arrays with
-        more dimensions are squeezed. NaN and +/-inf pixels are replaced by 0.
+        more dimensions are squeezed. NaN and +/-inf pixels are replaced by 0
+        unless ``nan_to_zero`` is False.
 
     Raises
     ------
@@ -540,6 +551,8 @@ def load_fits_2d_ensemble(fits_path):
         data = np.asarray(data, dtype=np.float64).copy()
     if data.ndim > 2:
         data = data[0] if data.ndim == 3 else data.squeeze()
+    if not nan_to_zero:
+        return data
     return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -871,6 +884,11 @@ def predict_ensemble(family_models, cutout_2d_normalized, device):
         the family means): a measure of how much the models disagree.
     """
     x = to_model_input(cutout_2d_normalized).unsqueeze(0).to(device)
+    return _ensemble_scores(family_models, x)
+
+
+def _ensemble_scores(family_models, x):
+    """Score one model-ready input tensor of shape (1, 3, H, W); see :func:`predict_ensemble`."""
     per_family_mean = {}
     all_raw = []
     with torch.no_grad():
@@ -1120,7 +1138,7 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
         The output catalog has all input columns plus, per row (see
         :func:`score_detection`): ``rb_<family>`` for each loaded family,
         ``real_bogus_score``, ``real_bogus_score_std`` and ``prediction``.
-        Its metadata records ``real_bogus_threshold``, ``real_bogus_model_dir``,
+        Its metadata records ``real_bogus_model`` ("diff"), ``real_bogus_threshold``, ``real_bogus_model_dir``,
         ``real_bogus_n_models`` and ``real_bogus_cutout_size``.
 
     Raises
@@ -1164,6 +1182,338 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
         "real_bogus_score", "real_bogus_score_std", "prediction"]
     for col in output_columns:
         data[col] = [r[col] for r in results]
+    data.meta["real_bogus_model"] = "diff"
+    data.meta["real_bogus_threshold"] = threshold
+    data.meta["real_bogus_model_dir"] = str(model_dir)
+    data.meta["real_bogus_n_models"] = total_models
+    data.meta["real_bogus_cutout_size"] = cutout_size
+
+    write_catalog(data, output_path, overwrite=True, output_format=output_format)
+
+
+# ============================================================================
+# 3-CHANNEL ENSEMBLE (Roman-Supernova-PIT/Real-Bogus-3ch on Hugging Face)
+# 2 architecture families x 4 members = 8 models. Input channels, in this
+# order: science, template, diff, all on the same pixel grid. Each channel is
+# prepared like the diff of the 1-channel ensemble (z-scale the full image,
+# 64x64 bilinear cutout, z-scale the cutout again). The models were trained
+# image-only: their "meta" input is always 0.
+# ============================================================================
+
+REPO_ID_3CH = "Roman-Supernova-PIT/Real-Bogus-3ch"
+FAMILIES_3CH = {"DenseNet121": "densenet121", "ConvNeXtTiny": "convnext_tiny"}
+CHANNELS_3CH = ("science", "template", "diff")
+
+
+class ThreeChannelClassifier(nn.Module):
+    """A timm backbone plus the (unused) meta branch of the 3-channel ensemble.
+
+    The layer names and sizes match the ``Real-Bogus-3ch`` checkpoints:
+    backbone features are concatenated with the output of a small MLP on the
+    "meta" input, followed by Linear(num_features + 64, 256) - ReLU - Dropout -
+    Linear(256, 1). The published models were trained without meta features,
+    so the meta input is always a vector of zeros.
+
+    Parameters
+    ----------
+    model_name : str
+        timm model name, e.g. ``"convnext_tiny"``.
+    n_meta : int, optional
+        Length of the meta input stored in the checkpoint. Default 1.
+    dropout : float, optional
+        Dropout probability in the head (only active in training mode).
+    """
+
+    def __init__(self, model_name, n_meta=1, dropout=0.3):
+        super().__init__()
+        import timm
+        self.n_meta = n_meta
+        self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0, global_pool="avg")
+        nf = self.backbone.num_features
+        self.meta = nn.Sequential(nn.Linear(n_meta, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU())
+        self.classifier = nn.Sequential(
+            nn.Linear(nf + 64, 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, 1))
+
+    def forward(self, x):
+        """Probability that each input stamp is a real transient.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (batch, 3, 64, 64): science, template, diff, values in [0, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch,), values in [0, 1].
+        """
+        meta = x.new_zeros((x.shape[0], self.n_meta))
+        features = torch.cat([self.backbone(x), self.meta(meta)], 1)
+        return torch.sigmoid(self.classifier(features)).squeeze(1)
+
+
+def checkpoints_3ch(model_dir, family):
+    """List the checkpoints of one 3-channel family in ``model_dir``.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model directory.
+    family : str
+        One of ``FAMILIES_3CH``.
+
+    Returns
+    -------
+    list of str
+        Sorted paths matching
+        ``<model_dir>/<family>_3ch_meta/<family>_3ch_meta_Ensemble_Model*_best*.pth``.
+    """
+    pattern = os.path.join(model_dir, f"{family}_3ch_meta", f"{family}_3ch_meta_Ensemble_Model*_best*.pth")
+    return sorted(glob.glob(pattern))
+
+
+def check_models_available_3ch(model_dir):
+    """Raise if any 3-channel family does not have exactly 4 checkpoints in ``model_dir``.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model directory.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a family is missing or incomplete. The message says how to download it.
+    """
+    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam)) != 4]
+    if missing:
+        raise FileNotFoundError(
+            f"3-channel real/bogus models missing from {model_dir}: {', '.join(missing)}. "
+            f"Download them once before running the pipeline with "
+            f"'python -m sidecar.classifier --download-models --model-type 3ch --model-dir {model_dir}', "
+            f"or run the pipeline with --no-real-bogus."
+        )
+
+
+def ensure_models_downloaded_3ch(model_dir):
+    """Download the 3-channel ensemble from ``REPO_ID_3CH`` if it is not complete in ``model_dir``.
+
+    Like :func:`ensure_models_downloaded`, this is meant to be run once per
+    system (``python -m sidecar.classifier --download-models --model-type 3ch``),
+    never from pipeline jobs. Needs Hugging Face credentials that can read
+    ``REPO_ID_3CH``.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local directory. Created if it does not exist.
+    """
+    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam)) != 4]
+    if not missing:
+        return
+    from huggingface_hub import snapshot_download
+    patterns = ["README.md"] + [f"{fam}_3ch_meta/*.pth" for fam in missing]
+    snapshot_download(repo_id=REPO_ID_3CH, local_dir=model_dir, allow_patterns=patterns)
+
+
+def default_model_dir_3ch():
+    """Return ``photometry.sidecar.real_bogus.model_dir_3ch`` from the default snappl config."""
+    return Config.get().value("photometry.sidecar.real_bogus.model_dir_3ch")
+
+
+def load_ensemble_3ch(model_dir, device):
+    """Load the 8 models of the 3-channel ensemble.
+
+    Parameters
+    ----------
+    model_dir : str or Path
+        Local model directory (see :func:`ensure_models_downloaded_3ch`).
+    device : torch.device
+        Device to place the models on.
+
+    Returns
+    -------
+    dict of str to list of torch.nn.Module
+        ``{family: [model, ...]}``, models in eval mode.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a family is not complete in ``model_dir``.
+    ValueError
+        If a checkpoint was trained with meta features, which this code does
+        not provide.
+    """
+    check_models_available_3ch(model_dir)
+    family_models = {}
+    for fam, timm_name in FAMILIES_3CH.items():
+        models = []
+        for path in checkpoints_3ch(model_dir, fam):
+            ckpt = torch.load(path, map_location=device)
+            if not ckpt.get("features", {}).get("image_only", False):
+                raise ValueError(f"{path} was trained with meta features; only image-only models are supported")
+            model = ThreeChannelClassifier(timm_name, n_meta=ckpt["n_meta"]).to(device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+            models.append(model)
+        family_models[fam] = models
+    return family_models
+
+
+def make_model_cutout_3ch(row, x_col, y_col, normalized_images, cutout_size=64):
+    """Make the (science, template, diff) stamp for one catalog row.
+
+    Each channel is made with :func:`make_model_cutout` at the same position,
+    so all three get the same sub-pixel cutout and second z-scale.
+
+    Parameters
+    ----------
+    row : astropy.table.Row
+        One row of the detection catalog.
+    x_col, y_col : str
+        Names of the position columns, from :func:`detect_catalog_type`.
+    normalized_images : sequence of 3 numpy.ndarray
+        Full science, template and diff images on the same pixel grid, each
+        already passed through :func:`normalize_with_zscale`.
+    cutout_size : int, optional
+        Cutout side length in pixels. Default 64.
+
+    Returns
+    -------
+    numpy.ndarray
+        float32 array of shape (3, cutout_size, cutout_size), values in [0, 1].
+
+    Raises
+    ------
+    ValueError
+        If the row's coordinates are unusable or the cutout would contain no
+        image pixels.
+    """
+    return np.stack([make_model_cutout(row, x_col, y_col, img, cutout_size) for img in normalized_images])
+
+
+def score_detection_3ch(row, x_col, y_col, normalized_images, family_models, device,
+                        threshold=0.5, cutout_size=64):
+    """Compute the 3-channel real/bogus scores for one catalog row.
+
+    Same output as :func:`score_detection` (``rb_<family>``,
+    ``real_bogus_score``, ``real_bogus_score_std``, ``prediction``), with the
+    stamp made by :func:`make_model_cutout_3ch`. Rows without a usable cutout
+    are labelled "invalid" with NaN scores.
+
+    Parameters
+    ----------
+    row, x_col, y_col, threshold, cutout_size
+        As for :func:`score_detection`.
+    normalized_images : sequence of 3 numpy.ndarray
+        See :func:`make_model_cutout_3ch`.
+    family_models : dict of str to list of torch.nn.Module
+        Output of :func:`load_ensemble_3ch`.
+    device : torch.device
+        Device the models are on.
+
+    Returns
+    -------
+    dict
+        One entry per output catalog column.
+    """
+    try:
+        stamp = make_model_cutout_3ch(row, x_col, y_col, normalized_images, cutout_size)
+    except ValueError:
+        result = {f"rb_{fam}": np.nan for fam in family_models}
+        result.update(real_bogus_score=np.nan, real_bogus_score_std=np.nan, prediction="invalid")
+        return result
+
+    x = torch.from_numpy(stamp).unsqueeze(0).to(device)
+    per_family_mean, overall_mean, overall_std = _ensemble_scores(family_models, x)
+    result = {f"rb_{fam}": per_family_mean[fam] for fam in family_models}
+    result.update(
+        real_bogus_score=overall_mean,
+        real_bogus_score_std=overall_std,
+        prediction="real" if overall_mean >= threshold else "bogus",
+    )
+    return result
+
+
+def process_single_catalog_ensemble_3ch(catalog_path, science_path, template_path, diff_path, output_path,
+                                         model_dir=None, cutout_size=64, threshold=0.5, device="auto",
+                                         output_format="parquet"):
+    """Add 3-channel real/bogus scores for every detection in a catalog and save it.
+
+    The 3-channel counterpart of :func:`process_single_catalog_ensemble`: same
+    output columns and metadata, but each detection is scored on a
+    (science, template, diff) stamp. The three images must be on the same
+    pixel grid as the catalog positions (sidecar writes the sky-subtracted
+    science and the template resampled onto the science grid for this, see
+    ``subtraction.Pipeline``).
+
+    Each full image is z-scaled once before cutting, as in training. The diff
+    has NaN/inf set to 0 first; in the science and template, NaN/inf pixels
+    are left out of the z-scale limits and set to 0 afterwards.
+
+    Parameters
+    ----------
+    catalog_path : str or Path
+        Input detection catalog, ECSV or Parquet.
+    science_path, template_path, diff_path : str or Path
+        Science, resampled template and difference images (FITS).
+    output_path : str or Path
+        Where to write the scored catalog. Overwritten if it exists.
+    model_dir : str or Path, optional
+        Directory holding the 3-channel weights. Default: the configured
+        ``photometry.sidecar.real_bogus.model_dir_3ch``.
+    cutout_size : int, optional
+        Cutout side length in pixels. Default 64; must be 64 for the published models.
+    threshold : float, optional
+        A detection is labelled "real" if its ``real_bogus_score`` is >= threshold. Default 0.5.
+    device : {"auto", "cpu", "cuda"}, optional
+        Where to run the models (see :func:`resolve_device`).
+    output_format : {"parquet", "ecsv"}, optional
+        Format of the output catalog. Default ``"parquet"``.
+
+    Raises
+    ------
+    ValueError
+        If ``output_format`` is unknown, the catalog has no position columns,
+        the images do not all have the same shape, or a checkpoint needs meta features.
+    FileNotFoundError
+        If the models are not in ``model_dir``.
+    """
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, not {output_format!r}")
+    if model_dir is None:
+        model_dir = default_model_dir_3ch()
+
+    device = resolve_device(device)
+    family_models = load_ensemble_3ch(model_dir, device)
+    total_models = sum(len(v) for v in family_models.values())
+
+    data = read_catalog(catalog_path)
+    catalog_type, x_col, y_col, id_col = detect_catalog_type(data)
+
+    normalized_images = [
+        normalize_with_zscale(load_fits_2d_ensemble(science_path, nan_to_zero=False)),
+        normalize_with_zscale(load_fits_2d_ensemble(template_path, nan_to_zero=False)),
+        normalize_with_zscale(load_fits_2d_ensemble(diff_path)),
+    ]
+    if len({img.shape for img in normalized_images}) != 1:
+        raise ValueError(f"science, template and diff images differ in shape: "
+                         f"{[img.shape for img in normalized_images]}")
+
+    n_rows = len(data)
+    log_every = max(1, n_rows // 10)
+    SNLogger.info(f"Scoring {n_rows} detections with {total_models} 3-channel models")
+    results = []
+    for i, row in enumerate(data, start=1):
+        results.append(score_detection_3ch(row, x_col, y_col, normalized_images, family_models, device,
+                                           threshold=threshold, cutout_size=cutout_size))
+        if i % log_every == 0 or i == n_rows:
+            SNLogger.info(f"Scored {i}/{n_rows} detections")
+    output_columns = list(results[0]) if results else [f"rb_{fam}" for fam in family_models] + [
+        "real_bogus_score", "real_bogus_score_std", "prediction"]
+    for col in output_columns:
+        data[col] = [r[col] for r in results]
+    data.meta["real_bogus_model"] = "3ch"
     data.meta["real_bogus_threshold"] = threshold
     data.meta["real_bogus_model_dir"] = str(model_dir)
     data.meta["real_bogus_n_models"] = total_models
@@ -1180,9 +1530,11 @@ def main(argv=None):
     downloading::
 
         python -m sidecar.classifier --download-models
+        python -m sidecar.classifier --download-models --model-type 3ch   # 3-channel ensemble
 
     Needs network access and Hugging Face credentials for ``REPO_ID``
-    (``hf auth login`` or ``HF_TOKEN``). Families already present are skipped.
+    (or ``REPO_ID_3CH``) (``hf auth login`` or ``HF_TOKEN``). Families already
+    present are skipped.
 
     Parameters
     ----------
@@ -1198,20 +1550,36 @@ def main(argv=None):
         help=f"Download the model ensemble from Hugging Face ({REPO_ID}) into --model-dir.",
     )
     parser.add_argument(
+        "--model-type",
+        default="diff",
+        choices=["diff", "3ch"],
+        help=f"'diff': the difference-image ensemble ({REPO_ID}); "
+        f"'3ch': the science/template/diff ensemble ({REPO_ID_3CH}).  Default: diff.",
+    )
+    parser.add_argument(
         "--model-dir",
         default=None,
-        help="Where to put the models.  Defaults to photometry.sidecar.real_bogus.model_dir in the config.",
+        help="Where to put the models.  Defaults to photometry.sidecar.real_bogus.model_dir "
+        "(model_dir_3ch with --model-type 3ch) in the config.",
     )
     parser.add_argument(
         "--families",
         nargs="+",
         default=ALL_FAMILIES,
         choices=ALL_FAMILIES,
-        help="Model families to download.  Default: all.",
+        help="Model families to download (--model-type diff only).  Default: all.",
     )
     args = parser.parse_args(argv)
     if not args.download_models:
         parser.error("nothing to do; pass --download-models")
+
+    if args.model_type == "3ch":
+        model_dir = args.model_dir if args.model_dir is not None else default_model_dir_3ch()
+        SNLogger.info(f"Downloading 3-channel real/bogus models ({', '.join(FAMILIES_3CH)}) into {model_dir}")
+        ensure_models_downloaded_3ch(model_dir)
+        check_models_available_3ch(model_dir)
+        SNLogger.info(f"3-channel real/bogus models are ready in {model_dir}")
+        return
 
     model_dir = args.model_dir if args.model_dir is not None else default_model_dir()
     SNLogger.info(f"Downloading real/bogus models ({', '.join(args.families)}) into {model_dir}")
