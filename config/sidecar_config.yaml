@@ -38,6 +38,9 @@ photometry:
       #   python -m sidecar.classifier --download-models --model-type 3ch).
       model: diff
       model_dir_3ch: ${system.paths.dev_storage}/sidecar/real_bogus_3ch_models
+      # Model version: the folder in the Hugging Face repository (and in
+      # model_dir_3ch) that holds the 3-channel models.
+      version_3ch: nov_24_2026
       # threshold for model "3ch"; not tuned yet on sidecar subtractions.
       threshold_3ch: 0.5
 

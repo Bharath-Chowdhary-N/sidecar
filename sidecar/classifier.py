@@ -1203,6 +1203,9 @@ def process_single_catalog_ensemble(catalog_path, fits_path, output_path,
 REPO_ID_3CH = "Roman-Supernova-PIT/Real-Bogus-3ch"
 FAMILIES_3CH = {"DenseNet121": "densenet121", "ConvNeXtTiny": "convnext_tiny"}
 CHANNELS_3CH = ("science", "template", "diff")
+# Model version = top-level folder in REPO_ID_3CH (and in the local model_dir_3ch), e.g.
+# nov_24_2026/DenseNet121_3ch_meta/... .  photometry.sidecar.real_bogus.version_3ch overrides it.
+VERSION_3CH = "nov_24_2026"
 
 
 class ThreeChannelClassifier(nn.Module):
@@ -1252,7 +1255,7 @@ class ThreeChannelClassifier(nn.Module):
         return torch.sigmoid(self.classifier(features)).squeeze(1)
 
 
-def checkpoints_3ch(model_dir, family):
+def checkpoints_3ch(model_dir, family, version=VERSION_3CH):
     """List the checkpoints of one 3-channel family in ``model_dir``.
 
     Parameters
@@ -1261,41 +1264,46 @@ def checkpoints_3ch(model_dir, family):
         Local model directory.
     family : str
         One of ``FAMILIES_3CH``.
+    version : str, optional
+        Model version (sub-folder of ``model_dir``). Default ``VERSION_3CH``.
 
     Returns
     -------
     list of str
         Sorted paths matching
-        ``<model_dir>/<family>_3ch_meta/<family>_3ch_meta_Ensemble_Model*_best*.pth``.
+        ``<model_dir>/<version>/<family>_3ch_meta/<family>_3ch_meta_Ensemble_Model*_best*.pth``.
     """
-    pattern = os.path.join(model_dir, f"{family}_3ch_meta", f"{family}_3ch_meta_Ensemble_Model*_best*.pth")
+    pattern = os.path.join(model_dir, version, f"{family}_3ch_meta",
+                           f"{family}_3ch_meta_Ensemble_Model*_best*.pth")
     return sorted(glob.glob(pattern))
 
 
-def check_models_available_3ch(model_dir):
+def check_models_available_3ch(model_dir, version=VERSION_3CH):
     """Raise if any 3-channel family does not have exactly 4 checkpoints in ``model_dir``.
 
     Parameters
     ----------
     model_dir : str or Path
         Local model directory.
+    version : str, optional
+        Model version (sub-folder of ``model_dir``). Default ``VERSION_3CH``.
 
     Raises
     ------
     FileNotFoundError
         If a family is missing or incomplete. The message says how to download it.
     """
-    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam)) != 4]
+    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam, version)) != 4]
     if missing:
         raise FileNotFoundError(
-            f"3-channel real/bogus models missing from {model_dir}: {', '.join(missing)}. "
+            f"3-channel real/bogus models (version {version}) missing from {model_dir}: {', '.join(missing)}. "
             f"Download them once before running the pipeline with "
             f"'python -m sidecar.classifier --download-models --model-type 3ch --model-dir {model_dir}', "
             f"or run the pipeline with --no-real-bogus."
         )
 
 
-def ensure_models_downloaded_3ch(model_dir):
+def ensure_models_downloaded_3ch(model_dir, version=VERSION_3CH):
     """Download the 3-channel ensemble from ``REPO_ID_3CH`` if it is not complete in ``model_dir``.
 
     Like :func:`ensure_models_downloaded`, this is meant to be run once per
@@ -1306,13 +1314,16 @@ def ensure_models_downloaded_3ch(model_dir):
     Parameters
     ----------
     model_dir : str or Path
-        Local directory. Created if it does not exist.
+        Local directory. Created if it does not exist. The repository layout
+        is kept, so the models land in ``<model_dir>/<version>/``.
+    version : str, optional
+        Model version (top-level folder of ``REPO_ID_3CH``). Default ``VERSION_3CH``.
     """
-    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam)) != 4]
+    missing = [fam for fam in FAMILIES_3CH if len(checkpoints_3ch(model_dir, fam, version)) != 4]
     if not missing:
         return
     from huggingface_hub import snapshot_download
-    patterns = ["README.md"] + [f"{fam}_3ch_meta/*.pth" for fam in missing]
+    patterns = ["README.md"] + [f"{version}/{fam}_3ch_meta/*.pth" for fam in missing]
     snapshot_download(repo_id=REPO_ID_3CH, local_dir=model_dir, allow_patterns=patterns)
 
 
@@ -1321,7 +1332,12 @@ def default_model_dir_3ch():
     return Config.get().value("photometry.sidecar.real_bogus.model_dir_3ch")
 
 
-def load_ensemble_3ch(model_dir, device):
+def default_version_3ch():
+    """Return ``photometry.sidecar.real_bogus.version_3ch`` from the default snappl config, else ``VERSION_3CH``."""
+    return Config.get().value("photometry.sidecar.real_bogus.version_3ch", default=VERSION_3CH)
+
+
+def load_ensemble_3ch(model_dir, device, version=VERSION_3CH):
     """Load the 8 models of the 3-channel ensemble.
 
     Parameters
@@ -1330,6 +1346,8 @@ def load_ensemble_3ch(model_dir, device):
         Local model directory (see :func:`ensure_models_downloaded_3ch`).
     device : torch.device
         Device to place the models on.
+    version : str, optional
+        Model version (sub-folder of ``model_dir``). Default ``VERSION_3CH``.
 
     Returns
     -------
@@ -1344,11 +1362,11 @@ def load_ensemble_3ch(model_dir, device):
         If a checkpoint was trained with meta features, which this code does
         not provide.
     """
-    check_models_available_3ch(model_dir)
+    check_models_available_3ch(model_dir, version)
     family_models = {}
     for fam, timm_name in FAMILIES_3CH.items():
         models = []
-        for path in checkpoints_3ch(model_dir, fam):
+        for path in checkpoints_3ch(model_dir, fam, version):
             ckpt = torch.load(path, map_location=device)
             if not ckpt.get("features", {}).get("image_only", False):
                 raise ValueError(f"{path} was trained with meta features; only image-only models are supported")
@@ -1437,7 +1455,7 @@ def score_detection_3ch(row, x_col, y_col, normalized_images, family_models, dev
 
 def process_single_catalog_ensemble_3ch(catalog_path, science_path, template_path, diff_path, output_path,
                                          model_dir=None, cutout_size=64, threshold=0.5, device="auto",
-                                         output_format="parquet"):
+                                         output_format="parquet", version=None):
     """Add 3-channel real/bogus scores for every detection in a catalog and save it.
 
     The 3-channel counterpart of :func:`process_single_catalog_ensemble`: same
@@ -1462,6 +1480,10 @@ def process_single_catalog_ensemble_3ch(catalog_path, science_path, template_pat
     model_dir : str or Path, optional
         Directory holding the 3-channel weights. Default: the configured
         ``photometry.sidecar.real_bogus.model_dir_3ch``.
+    version : str, optional
+        Model version, the sub-folder of ``model_dir`` holding the families.
+        Default: the configured ``photometry.sidecar.real_bogus.version_3ch``
+        (``VERSION_3CH`` if not set).
     cutout_size : int, optional
         Cutout side length in pixels. Default 64; must be 64 for the published models.
     threshold : float, optional
@@ -1483,9 +1505,11 @@ def process_single_catalog_ensemble_3ch(catalog_path, science_path, template_pat
         raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, not {output_format!r}")
     if model_dir is None:
         model_dir = default_model_dir_3ch()
+    if version is None:
+        version = default_version_3ch()
 
     device = resolve_device(device)
-    family_models = load_ensemble_3ch(model_dir, device)
+    family_models = load_ensemble_3ch(model_dir, device, version)
     total_models = sum(len(v) for v in family_models.values())
 
     data = read_catalog(catalog_path)
@@ -1514,6 +1538,7 @@ def process_single_catalog_ensemble_3ch(catalog_path, science_path, template_pat
     for col in output_columns:
         data[col] = [r[col] for r in results]
     data.meta["real_bogus_model"] = "3ch"
+    data.meta["real_bogus_version"] = version
     data.meta["real_bogus_threshold"] = threshold
     data.meta["real_bogus_model_dir"] = str(model_dir)
     data.meta["real_bogus_n_models"] = total_models
@@ -1563,6 +1588,12 @@ def main(argv=None):
         "(model_dir_3ch with --model-type 3ch) in the config.",
     )
     parser.add_argument(
+        "--version-3ch",
+        default=None,
+        help="Model version to download with --model-type 3ch (top-level folder of the Hugging Face repository).  "
+        f"Defaults to photometry.sidecar.real_bogus.version_3ch in the config, else {VERSION_3CH}.",
+    )
+    parser.add_argument(
         "--families",
         nargs="+",
         default=ALL_FAMILIES,
@@ -1575,9 +1606,11 @@ def main(argv=None):
 
     if args.model_type == "3ch":
         model_dir = args.model_dir if args.model_dir is not None else default_model_dir_3ch()
-        SNLogger.info(f"Downloading 3-channel real/bogus models ({', '.join(FAMILIES_3CH)}) into {model_dir}")
-        ensure_models_downloaded_3ch(model_dir)
-        check_models_available_3ch(model_dir)
+        version = args.version_3ch if args.version_3ch is not None else default_version_3ch()
+        SNLogger.info(f"Downloading 3-channel real/bogus models ({', '.join(FAMILIES_3CH)}, version {version}) "
+                      f"into {model_dir}")
+        ensure_models_downloaded_3ch(model_dir, version)
+        check_models_available_3ch(model_dir, version)
         SNLogger.info(f"3-channel real/bogus models are ready in {model_dir}")
         return
 

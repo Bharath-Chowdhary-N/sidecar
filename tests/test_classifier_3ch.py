@@ -20,8 +20,8 @@ def one_family(monkeypatch):
 
 
 def write_checkpoints(model_dir, image_only=True):
-    """Save 4 random DenseNet121 members as <model_dir>/DenseNet121_3ch_meta/..._Model<k>_best.pth."""
-    fam_dir = model_dir / "DenseNet121_3ch_meta"
+    """Save 4 random DenseNet121 members as <model_dir>/<VERSION_3CH>/DenseNet121_3ch_meta/..._Model<k>_best.pth."""
+    fam_dir = model_dir / classifier.VERSION_3CH / "DenseNet121_3ch_meta"
     fam_dir.mkdir(parents=True)
     torch.manual_seed(0)
     for k in range(1, 5):
@@ -87,7 +87,8 @@ def test_process_single_catalog_ensemble_3ch(tmp_path, one_family):
     output_path = tmp_path / "real_bogus_score_detection.ecsv"
 
     classifier.process_single_catalog_ensemble_3ch(
-        catalog_path, *paths, output_path, model_dir=model_dir, device="cpu", output_format="ecsv")
+        catalog_path, *paths, output_path, model_dir=model_dir, device="cpu", output_format="ecsv",
+        version=classifier.VERSION_3CH)
 
     result = read_catalog(output_path)
     assert list(result["prediction"][:2]) != ["invalid", "invalid"]
@@ -96,6 +97,7 @@ def test_process_single_catalog_ensemble_3ch(tmp_path, one_family):
     assert np.all((scores >= 0) & (scores <= 1))
     np.testing.assert_allclose(scores, np.asarray(result["rb_DenseNet121"][:2], dtype=float))
     assert result.meta["real_bogus_model"] == "3ch"
+    assert result.meta["real_bogus_version"] == classifier.VERSION_3CH
     assert result.meta["real_bogus_n_models"] == 4
 
 
@@ -108,3 +110,9 @@ def test_load_ensemble_3ch_rejects_meta_models(tmp_path, one_family):
 def test_missing_3ch_models_say_how_to_download(tmp_path, one_family):
     with pytest.raises(FileNotFoundError, match="--model-type 3ch"):
         classifier.load_ensemble_3ch(tmp_path, torch.device("cpu"))
+
+
+def test_checkpoints_3ch_use_version_folder(tmp_path, one_family):
+    write_checkpoints(tmp_path)
+    assert len(classifier.checkpoints_3ch(tmp_path, "DenseNet121")) == 4
+    assert classifier.checkpoints_3ch(tmp_path, "DenseNet121", version="other_version") == []

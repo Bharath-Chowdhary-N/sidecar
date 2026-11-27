@@ -941,6 +941,7 @@ class Detection:
                     diff_path=file_path["difference_image_path"],
                     output_path=file_path[f"real_bogus_{rb_input_key}"],
                     model_dir=self.config.value("photometry.sidecar.real_bogus.model_dir_3ch", default=None),
+                    version=self.config.value("photometry.sidecar.real_bogus.version_3ch", default=None),
                     threshold=self.config.value("photometry.sidecar.real_bogus.threshold_3ch", default=0.5),
                     device=rb_device,
                     output_format=self.output_format,

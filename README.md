@@ -104,6 +104,9 @@ and select it with `photometry.sidecar.real_bogus.model: 3ch` in the config
 subtraction then also writes `rb_science_*.fits` (sky-subtracted science) and
 `rb_template_*.fits` (template resampled onto the science grid) to the output
 directory, and the scores go to the same `real_bogus_*` catalog. Its
+model version is `photometry.sidecar.real_bogus.version_3ch` (default
+`nov_24_2026`, the folder in the Hugging Face repository; the models land in
+`<model_dir_3ch>/<version_3ch>/`), and its
 threshold is `photometry.sidecar.real_bogus.threshold_3ch` (default 0.5, not
 yet tuned on sidecar subtractions).
 
